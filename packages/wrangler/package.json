@@ -179,7 +179,7 @@
 		"timeago.js": "^4.0.2",
 		"tmp-promise": "^3.0.3",
 		"ts-dedent": "^2.2.0",
-		"undici": "5.20.0",
+		"undici": "5.26.2",
 		"update-check": "^1.5.4",
 		"vitest": "^0.31.0",
 		"ws": "^8.5.0",
