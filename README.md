@@ -2,6 +2,8 @@
 
 This monorepo contains:
 
+foo
+
 - [`wrangler-devtools`](https://github.com/cloudflare/workers-sdk/tree/main/packages/wrangler-devtools)
   Cloudflare's fork of Chrome DevTools for inspecting your local or remote Workers
 - [`templates`](https://github.com/cloudflare/workers-sdk/tree/main/templates)
