@@ -16,7 +16,7 @@
 		"@cloudflare/workers-tsconfig": "*",
 		"@cloudflare/workers-types": "^4.20221111.1",
 		"pages-plugin-example": "*",
-		"undici": "^5.9.1",
+		"undici": "^5.26.2",
 		"wrangler": "*"
 	},
 	"engines": {
