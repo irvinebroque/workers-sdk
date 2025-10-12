@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { createInterface } from "node:readline";
 import path from "node:path";
 import {
 	Log,
@@ -10,11 +11,13 @@ import {
 	Mutex,
 	Miniflare,
 } from "miniflare";
+import { red } from "kleur/colors";
 import { logger } from "../logger";
 import { ModuleTypeToRuleType } from "../module-collection";
+import { SourceMapConsumer } from "source-map";
 import type { Config } from "../config";
 import type { WorkerRegistry } from "../dev-registry";
-import type { LoggerLevel } from "../logger";
+import type { Logger, LoggerLevel } from "../logger";
 import type { AssetPaths } from "../sites";
 import type {
 	CfD1Database,
@@ -35,6 +38,8 @@ import type {
 	QueueConsumerOptions,
 } from "miniflare";
 import type { Abortable } from "node:events";
+import type { Readable } from "node:stream";
+import type { SourceMapMetadata } from "../inspect";
 
 // This worker proxies all external Durable Objects to the Wrangler session
 // where they're defined, and receives all requests from other Wrangler sessions
@@ -356,15 +361,221 @@ function buildPersistOptions(config: ConfigBundle): PersistOptions | undefined {
 }
 
 function buildSitesOptions({ assetPaths }: ConfigBundle) {
-	if (assetPaths !== undefined) {
-		const { baseDirectory, assetDirectory, includePatterns, excludePatterns } =
-			assetPaths;
-		return {
-			sitePath: path.join(baseDirectory, assetDirectory),
-			siteInclude: includePatterns.length > 0 ? includePatterns : undefined,
-			siteExclude: excludePatterns.length > 0 ? excludePatterns : undefined,
-		};
-	}
+        if (assetPaths !== undefined) {
+                const { baseDirectory, assetDirectory, includePatterns, excludePatterns } =
+                        assetPaths;
+                return {
+                        sitePath: path.join(baseDirectory, assetDirectory),
+                        siteInclude: includePatterns.length > 0 ? includePatterns : undefined,
+                        siteExclude: excludePatterns.length > 0 ? excludePatterns : undefined,
+                };
+        }
+}
+
+const STACK_LINE_REGEX = /^\s*at\s/;
+const STACK_FRAME_REGEX = /^\s*at\s+(?:(.*?)\s+\()?(.+):(\d+):(\d+)\)?$/;
+
+interface RuntimeStdioHandlerOptions {
+        logger: Logger;
+        sourceMapPath: string | undefined;
+        sourceMapMetadata: SourceMapMetadata | undefined;
+        entryDirectory: string;
+}
+
+export function createRuntimeStdioHandler({
+        logger,
+        sourceMapPath,
+        sourceMapMetadata,
+        entryDirectory,
+}: RuntimeStdioHandlerOptions) {
+        const resolvedEntryDirectory = path.resolve(entryDirectory);
+        const metadataEntryDirectory = sourceMapMetadata?.entryDirectory
+                ? path.resolve(sourceMapMetadata.entryDirectory)
+                : resolvedEntryDirectory;
+        const protocolRegex = /^[a-z][a-z0-9+.-]*:\/\//i;
+        let sourceMapPromise: Promise<Record<string, unknown> | undefined> | undefined;
+
+        const getSourceMap = () => {
+                if (sourceMapPath === undefined) {
+                        return undefined;
+                }
+                if (sourceMapPromise === undefined) {
+                        sourceMapPromise = readFile(sourceMapPath, "utf-8")
+                                .then((content) => JSON.parse(content) as Record<string, unknown>)
+                                .catch(() => undefined);
+                }
+                return sourceMapPromise;
+        };
+
+        const normalisePath = (value: string) => value.replace(/\\/g, "/");
+
+        const formatSourcePath = (source: string) => {
+                if (protocolRegex.test(source)) {
+                        return source;
+                }
+                const resolvedSource = path.isAbsolute(source)
+                        ? path.normalize(source)
+                        : path.normalize(path.resolve(metadataEntryDirectory, source));
+                const relative = path.relative(resolvedEntryDirectory, resolvedSource);
+                const display = relative === "" ? path.basename(resolvedSource) : relative;
+                return normalisePath(display);
+        };
+
+        const mapStack = async (
+                header: string | undefined,
+                stackLines: string[]
+        ): Promise<string[]> => {
+                const rawMap = await getSourceMap();
+                const result: string[] = header !== undefined ? [header] : [];
+                if (rawMap === undefined) {
+                        return header !== undefined ? [header, ...stackLines] : [...stackLines];
+                }
+
+                try {
+                        let snippetAdded = false;
+                        await SourceMapConsumer.with(rawMap, null, async (consumer) => {
+                                for (const line of stackLines) {
+                                        if (line.trim() === "") {
+                                                result.push(line);
+                                                continue;
+                                        }
+                                        const match = line.trim().match(STACK_FRAME_REGEX);
+                                        if (match === null) {
+                                                result.push(line);
+                                                continue;
+                                        }
+                                        const [, rawFunctionName, _generatedPath, lineText, columnText] = match;
+                                        const generatedLine = Number(lineText);
+                                        const generatedColumn = Math.max(0, Number(columnText) - 1);
+                                        if (!Number.isFinite(generatedLine) || !Number.isFinite(generatedColumn)) {
+                                                result.push(line);
+                                                continue;
+                                        }
+                                        const original = consumer.originalPositionFor({
+                                                line: generatedLine,
+                                                column: generatedColumn,
+                                        });
+                                        if (
+                                                original.source === null ||
+                                                original.line === null ||
+                                                original.column === null
+                                        ) {
+                                                result.push(line);
+                                                continue;
+                                        }
+
+                                        if (!snippetAdded) {
+                                                const sourceContent = consumer.sourceContentFor(
+                                                        original.source,
+                                                        true
+                                                );
+                                                if (sourceContent) {
+                                                        const sourceLines = sourceContent.split(/\r?\n/);
+                                                        const sourceLine = sourceLines[original.line - 1];
+                                                        if (sourceLine !== undefined) {
+                                                                result.push(sourceLine.trimEnd());
+                                                                const pointerOffset = Math.max(
+                                                                        0,
+                                                                        (original.column ?? 0)
+                                                                );
+                                                                result.push(`${" ".repeat(pointerOffset)}^`);
+                                                        }
+                                                }
+                                                snippetAdded = true;
+                                        }
+
+                                        const indent = line.match(/^\s*/)?.[0] ?? "";
+                                        const functionName = original.name ?? rawFunctionName ?? "";
+                                        const displayColumn = (original.column ?? 0) + 1;
+                                        const location = `${formatSourcePath(original.source)}:${original.line}:${
+                                                displayColumn
+                                        }`;
+                                        if (functionName) {
+                                                result.push(`${indent}at ${functionName} (${location})`);
+                                        } else {
+                                                result.push(`${indent}at ${location}`);
+                                        }
+                                }
+                        });
+                } catch {
+                        return header !== undefined ? [header, ...stackLines] : [...stackLines];
+                }
+                return result;
+        };
+
+        return (stdout: Readable, stderr: Readable) => {
+                const stdoutInterface = createInterface({ input: stdout });
+                stdoutInterface.on("line", (line) => console.log(line));
+
+                const stderrInterface = createInterface({ input: stderr });
+                let bufferedLine: string | undefined;
+                let currentHeader: string | undefined;
+                let currentStack: string[] | undefined;
+                let queue = Promise.resolve();
+
+                const outputLine = (line: string | undefined) => {
+                        if (line === undefined) {
+                                return;
+                        }
+                        console.error(red(line));
+                };
+
+                const flushStack = async () => {
+                        if (currentStack === undefined) {
+                                return;
+                        }
+                        const stackLines = currentStack;
+                        const header = currentHeader;
+                        currentStack = undefined;
+                        currentHeader = undefined;
+                        const mapped = await mapStack(header, stackLines);
+                        if (mapped.length > 0) {
+                                logger.error(mapped.join("\n"));
+                        } else {
+                                outputLine(header);
+                                stackLines.forEach((line) => outputLine(line));
+                        }
+                };
+
+                const processLine = async (line: string): Promise<void> => {
+                        const trimmed = line.trim();
+                        const isStackLine = STACK_LINE_REGEX.test(trimmed);
+                        if (currentStack !== undefined) {
+                                if (isStackLine || trimmed === "") {
+                                        currentStack.push(line);
+                                        return;
+                                }
+                                await flushStack();
+                                await processLine(line);
+                                return;
+                        }
+                        if (isStackLine) {
+                                currentHeader = bufferedLine;
+                                currentStack = [line];
+                                bufferedLine = undefined;
+                                return;
+                        }
+                        outputLine(bufferedLine);
+                        bufferedLine = line;
+                };
+
+                const handleRejection = (error: unknown) => {
+                        outputLine(error instanceof Error ? error.stack ?? error.message : String(error));
+                };
+
+                stderrInterface.on("line", (line) => {
+                        queue = queue.then(() => processLine(line)).catch(handleRejection);
+                });
+                stderrInterface.on("close", () => {
+                        queue = queue
+                                .then(async () => {
+                                        await flushStack();
+                                        outputLine(bufferedLine);
+                                        bufferedLine = undefined;
+                                })
+                                .catch(handleRejection);
+                });
+        };
 }
 
 async function buildMiniflareOptions(
@@ -391,20 +602,26 @@ async function buildMiniflareOptions(
 	const sitesOptions = buildSitesOptions(config);
 	const persistOptions = buildPersistOptions(config);
 
-	const options: MiniflareOptions = {
-		host: config.initialIp,
-		port: config.initialPort,
-		inspectorPort: config.inspect ? config.inspectorPort : undefined,
-		liveReload: config.liveReload,
-		upstream,
+        const options: MiniflareOptions = {
+                host: config.initialIp,
+                port: config.initialPort,
+                inspectorPort: config.inspect ? config.inspectorPort : undefined,
+                liveReload: config.liveReload,
+                upstream,
 
-		log,
-		verbose: logger.loggerLevel === "debug",
+                log,
+                verbose: logger.loggerLevel === "debug",
+                handleRuntimeStdio: createRuntimeStdioHandler({
+                        logger,
+                        sourceMapPath: config.bundle.sourceMapPath,
+                        sourceMapMetadata: config.bundle.sourceMapMetadata,
+                        entryDirectory: config.bundle.entry.directory,
+                }),
 
-		...persistOptions,
-		workers: [
-			{
-				name: getName(config),
+                ...persistOptions,
+                workers: [
+                        {
+                                name: getName(config),
 				compatibilityDate: config.compatibilityDate,
 				compatibilityFlags: config.compatibilityFlags,
 
