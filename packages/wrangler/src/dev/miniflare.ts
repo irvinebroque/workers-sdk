@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	Log,
 	LogLevel,
@@ -10,6 +11,7 @@ import {
 	Mutex,
 	Miniflare,
 } from "miniflare";
+import { SourceMapConsumer } from "source-map";
 import { logger } from "../logger";
 import { ModuleTypeToRuleType } from "../module-collection";
 import type { Config } from "../config";
@@ -26,6 +28,7 @@ import type {
 } from "../worker";
 import type { CfWorkerInit } from "../worker";
 import type { EsbuildBundle } from "./use-esbuild";
+import type { RawSourceMap } from "source-map";
 import type {
 	MiniflareOptions,
 	SourceOptions,
@@ -445,6 +448,215 @@ export class ErrorEvent extends Event implements ErrorEventOptions {
 	}
 }
 
+interface ParsedStackFrame {
+	readonly type: "withFunction" | "simple";
+	readonly functionName?: string;
+	readonly path: string;
+	readonly line: number;
+	readonly column: number;
+}
+
+function parseStackFrame(line: string): ParsedStackFrame | undefined {
+	const withFunctionMatch = line.match(
+		/^\s*at (?<functionName>.+?) \((?<path>.*):(?<line>\d+):(?<column>\d+)\)$/
+	);
+	if (withFunctionMatch?.groups !== undefined) {
+		return {
+		        type: "withFunction",
+		        functionName: withFunctionMatch.groups.functionName,
+		        path: withFunctionMatch.groups.path,
+		        line: Number.parseInt(withFunctionMatch.groups.line, 10),
+		        column: Number.parseInt(withFunctionMatch.groups.column, 10),
+		};
+	}
+	const simpleMatch = line.match(/^\s*at (?<path>.*):(?<line>\d+):(?<column>\d+)$/);
+	if (simpleMatch?.groups !== undefined) {
+		return {
+		        type: "simple",
+		        path: simpleMatch.groups.path,
+		        line: Number.parseInt(simpleMatch.groups.line, 10),
+		        column: Number.parseInt(simpleMatch.groups.column, 10),
+		};
+	}
+}
+
+function toAbsoluteFramePath(framePath: string, bundle: EsbuildBundle): string | undefined {
+	if (framePath.startsWith("node:")) {
+		return undefined;
+	}
+	if (/^[a-zA-Z]+:\/\//.test(framePath) && !framePath.startsWith("file://")) {
+		        return undefined;
+	}
+	if (framePath.startsWith("file://")) {
+		try {
+		        return fileURLToPath(framePath);
+		} catch {
+		        return undefined;
+		}
+	}
+	const normalised = path.normalize(framePath);
+	return path.isAbsolute(normalised)
+		? normalised
+		: path.resolve(path.dirname(bundle.path), normalised);
+}
+
+function isWithinDirectory(filePath: string, directory: string): boolean {
+	const relative = path.relative(directory, filePath);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function shouldMapFrame(framePath: string, bundle: EsbuildBundle): boolean {
+	const absolute = path.normalize(framePath);
+	if (absolute === path.normalize(bundle.path)) {
+		return true;
+	}
+	const tmpDir = bundle.sourceMapMetadata?.tmpDir;
+	return tmpDir !== undefined && isWithinDirectory(absolute, path.resolve(tmpDir));
+}
+
+function resolveOriginalSource(
+	source: string,
+	metadata: EsbuildBundle["sourceMapMetadata"]
+): string {
+	if (/^[a-zA-Z]+:\/\//.test(source)) {
+		return source;
+	}
+	if (path.isAbsolute(source)) {
+		return path.normalize(source);
+	}
+	if (metadata?.entryDirectory !== undefined) {
+		return path.resolve(metadata.entryDirectory, source);
+	}
+	return source;
+}
+
+function formatDisplayPath(sourcePath: string): string {
+	if (/^[a-zA-Z]+:\/\//.test(sourcePath)) {
+		return sourcePath;
+	}
+	const relative = path.relative(process.cwd(), sourcePath);
+	return relative.startsWith("..") ? sourcePath : relative;
+}
+
+function buildSnippet(
+	consumer: SourceMapConsumer,
+	source: string,
+	line: number,
+	column: number
+): string[] | undefined {
+	const contents = consumer.sourceContentFor(source, true);
+	if (contents === null) {
+		return undefined;
+	}
+	const allLines = contents.split(/\r?\n/);
+	const snippetLine = allLines[line - 1];
+	if (snippetLine === undefined) {
+		return undefined;
+	}
+	const trimmed = snippetLine.trimStart();
+	const leadingWhitespace = snippetLine.length - trimmed.length;
+	const caretColumn = Math.max(column - 1 - leadingWhitespace, 0);
+	const pointer = `${" ".repeat(caretColumn)}^`;
+	return [`  ${trimmed}`, `  ${pointer}`];
+}
+
+async function rewriteErrorStack(error: unknown, bundle: EsbuildBundle): Promise<void> {
+	if (
+		bundle.sourceMapPath === undefined ||
+		typeof bundle.sourceMapPath !== "string" ||
+		!(error instanceof Error) ||
+		typeof error.stack !== "string"
+	) {
+		return;
+	}
+
+	const mapPath = path.isAbsolute(bundle.sourceMapPath)
+		? bundle.sourceMapPath
+		: path.resolve(path.dirname(bundle.path), bundle.sourceMapPath);
+
+	let rawSourceMap: RawSourceMap;
+	try {
+		rawSourceMap = JSON.parse(await readFile(mapPath, "utf-8"));
+	} catch {
+		return;
+	}
+
+	const originalStackLines = error.stack.split("\n");
+	if (originalStackLines.length === 0) {
+		return;
+	}
+
+	await SourceMapConsumer.with(rawSourceMap, null, async (consumer) => {
+		const mappedLines: string[] = [];
+		const restOfStack: string[] = [];
+		let snippetLines: string[] | undefined;
+		let mapped = false;
+
+		for (let i = 1; i < originalStackLines.length; i++) {
+		        const stackLine = originalStackLines[i];
+		        const parsed = parseStackFrame(stackLine);
+		        if (parsed === undefined) {
+		                restOfStack.push(stackLine);
+		                continue;
+		        }
+		        const framePath = toAbsoluteFramePath(parsed.path, bundle);
+		        if (framePath === undefined || !shouldMapFrame(framePath, bundle)) {
+		                restOfStack.push(stackLine);
+		                continue;
+		        }
+		        const position = consumer.originalPositionFor({
+		                line: parsed.line,
+		                column: Math.max(parsed.column - 1, 0),
+		        });
+		        if (
+		                position.source === null ||
+		                position.line === null ||
+		                position.column === null
+		        ) {
+		                restOfStack.push(stackLine);
+		                continue;
+		        }
+
+		        mapped = true;
+		        if (snippetLines === undefined) {
+		                const snippet = buildSnippet(
+		                        consumer,
+		                        position.source,
+		                        position.line,
+		                        position.column + 1
+		                );
+		                if (snippet !== undefined) {
+		                        snippetLines = snippet;
+		                }
+		        }
+
+		        const resolvedSource = resolveOriginalSource(
+		                position.source,
+		                bundle.sourceMapMetadata
+		        );
+		        const displayPath = formatDisplayPath(resolvedSource);
+		        const displayColumn = position.column + 1;
+		        const location = `${displayPath}:${position.line}:${displayColumn}`;
+		        const mappedLine =
+		                parsed.type === "withFunction"
+		                        ? `    at ${parsed.functionName} (${location})`
+		                        : `    at ${location}`;
+		        restOfStack.push(mappedLine);
+		}
+
+		if (!mapped) {
+		        return;
+		}
+
+		mappedLines.push(originalStackLines[0]);
+		if (snippetLines !== undefined) {
+		        mappedLines.push(...snippetLines);
+		}
+		mappedLines.push(...restOfStack);
+		error.stack = mappedLines.join("\n");
+	});
+}
+
 export type MiniflareServerEventMap = {
 	reloaded: ReloadedEvent;
 	error: ErrorEvent;
@@ -461,10 +673,10 @@ export class MiniflareServer extends TypedEventTarget<MiniflareServerEventMap> {
 	async #onBundleUpdate(config: ConfigBundle, opts?: Abortable): Promise<void> {
 		if (opts?.signal?.aborted) return;
 		try {
-			const { options, internalObjects } = await buildMiniflareOptions(
-				this.#log,
-				config
-			);
+		        const { options, internalObjects } = await buildMiniflareOptions(
+		                this.#log,
+		                config
+		        );
 			if (opts?.signal?.aborted) return;
 			if (this.#mf === undefined) {
 				this.#mf = new Miniflare(options);
@@ -477,9 +689,10 @@ export class MiniflareServer extends TypedEventTarget<MiniflareServerEventMap> {
 				url,
 				internalDurableObjects: internalObjects,
 			});
-			this.dispatchEvent(event);
+		        this.dispatchEvent(event);
 		} catch (error: unknown) {
-			this.dispatchEvent(new ErrorEvent("error", { error }));
+		        await rewriteErrorStack(error, config.bundle);
+		        this.dispatchEvent(new ErrorEvent("error", { error }));
 		}
 	}
 	onBundleUpdate(config: ConfigBundle, opts?: Abortable): Promise<void> {
