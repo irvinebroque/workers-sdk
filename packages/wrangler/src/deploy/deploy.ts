@@ -1233,17 +1233,10 @@ export async function publishRoutes(
 	}
 ): Promise<string[]> {
 	try {
-		return await fetchResult(complianceConfig, `${workerUrl}/routes`, {
-			// Note: PUT will delete previous routes on this script.
-			method: "PUT",
-			body: JSON.stringify(
-				routes.map((route) =>
-					typeof route !== "object" ? { pattern: route } : route
-				)
-			),
-			headers: {
-				"Content-Type": "application/json",
-			},
+		return await publishRoutesZeroDowntime(complianceConfig, routes, {
+			workerUrl,
+			scriptName,
+			accountId,
 		});
 	} catch (e) {
 		if (isAuthenticationError(e)) {
@@ -1261,6 +1254,38 @@ export async function publishRoutes(
 }
 
 /**
+ * Update routes for the Worker using the zone-based API to avoid downtime.
+ */
+
+type WorkerRouteWithZone = {
+	id: string;
+	pattern: string;
+	script: string;
+	zone_id?: string;
+};
+
+async function publishRoutesZeroDowntime(
+	complianceConfig: ComplianceConfig,
+	routes: Route[],
+	{
+		workerUrl,
+		scriptName,
+		accountId,
+	}: { workerUrl: string; scriptName: string; accountId: string }
+) {
+	const existingRouteAssignments = await fetchResult<WorkerRouteWithZone[]>(
+		complianceConfig,
+		`${workerUrl}/routes`
+	);
+	return await publishRoutesFallback(complianceConfig, routes, {
+		scriptName,
+		useServiceEnvironments: false,
+		accountId,
+		existingRouteAssignments,
+	});
+}
+
+/**
  * Try updating routes for the Worker using a less optimal zone-based API.
  *
  * Compute match zones to the routes, then for each route attempt to connect it to the Worker via the zone.
@@ -1272,7 +1297,13 @@ async function publishRoutesFallback(
 		scriptName,
 		useServiceEnvironments,
 		accountId,
-	}: { scriptName: string; useServiceEnvironments: boolean; accountId: string }
+		existingRouteAssignments,
+	}: {
+		scriptName: string;
+		useServiceEnvironments: boolean;
+		accountId: string;
+		existingRouteAssignments?: WorkerRouteWithZone[];
+	}
 ) {
 	if (useServiceEnvironments) {
 		throw new UserError(
@@ -1281,12 +1312,14 @@ async function publishRoutesFallback(
 			{ telemetryMessage: true }
 		);
 	}
-	logger.info(
-		"The current authentication token does not have 'All Zones' permissions.\n" +
-			"Falling back to using the zone-based API endpoint to update each route individually.\n" +
-			"Note that there is no access to routes associated with zones that the API token does not have permission for.\n" +
-			"Existing routes for this Worker in such zones will not be deleted."
-	);
+	if (!existingRouteAssignments) {
+		logger.info(
+			"The current authentication token does not have 'All Zones' permissions.\n" +
+				"Falling back to using the zone-based API endpoint to update each route individually.\n" +
+				"Note that there is no access to routes associated with zones that the API token does not have permission for.\n" +
+				"Existing routes for this Worker in such zones will not be deleted."
+		);
+	}
 
 	const deployedRoutes: string[] = [];
 
@@ -1294,9 +1327,8 @@ async function publishRoutesFallback(
 	const queuePromises: Array<Promise<void>> = [];
 	const zoneIdCache = new Map();
 
-	// Collect the routes (and their zones) that will be deployed.
-	const activeZones = new Map<string, string>();
-	const routesToDeploy = new Map<string, string>();
+	const desiredRoutesByZone = new Map<string, string[]>();
+	const zonesToInspect = new Map<string, string>();
 	for (const route of routes) {
 		queuePromises.push(
 			queue.add(async () => {
@@ -1306,37 +1338,54 @@ async function publishRoutesFallback(
 					zoneIdCache
 				);
 				if (zone) {
-					activeZones.set(zone.id, zone.host);
-					routesToDeploy.set(
-						typeof route === "string" ? route : route.pattern,
-						zone.id
-					);
+					zonesToInspect.set(zone.id, zone.host);
+					const pattern = typeof route === "string" ? route : route.pattern;
+					desiredRoutesByZone.set(zone.id, [
+						...(desiredRoutesByZone.get(zone.id) ?? []),
+						pattern,
+					]);
 				}
 			})
 		);
 	}
+
+	const resolvedExistingRoutes = existingRouteAssignments ?? [];
+	for (const existing of resolvedExistingRoutes) {
+		if (existing.zone_id) {
+			zonesToInspect.set(existing.zone_id, "");
+			continue;
+		}
+
+		queuePromises.push(
+			queue.add(async () => {
+				const zone = await getZoneForRoute(
+					complianceConfig,
+					{ route: existing.pattern, accountId },
+					zoneIdCache
+				);
+				if (zone) {
+					zonesToInspect.set(zone.id, zone.host);
+				}
+			})
+		);
+	}
+
 	await Promise.all(queuePromises.splice(0, queuePromises.length));
 
-	// Collect the routes that are already deployed.
-	const allRoutes = new Map<string, string>();
-	const alreadyDeployedRoutes = new Set<string>();
-	for (const [zone, host] of activeZones) {
+	const existingRoutesByZone = new Map<string, WorkerRouteWithZone[]>();
+	for (const [zoneId, host] of zonesToInspect) {
 		queuePromises.push(
 			queue.add(async () => {
 				try {
-					for (const { pattern, script } of await fetchListResult<{
-						pattern: string;
-						script: string;
-					}>(complianceConfig, `/zones/${zone}/workers/routes`)) {
-						allRoutes.set(pattern, script);
-						if (script === scriptName) {
-							alreadyDeployedRoutes.add(pattern);
-						}
-					}
+					const routesInZone = await fetchListResult<WorkerRouteWithZone>(
+						complianceConfig,
+						`/zones/${zoneId}/workers/routes`
+					);
+					existingRoutesByZone.set(zoneId, routesInZone);
 				} catch (e) {
 					if (isAuthenticationError(e)) {
 						e.notes.push({
-							text: `This could be because the API token being used does not have permission to access the zone "${host}" (${zone}).`,
+							text: `This could be because the API token being used does not have permission to access the zone "${host}" (${zoneId}).`,
 						});
 					}
 					throw e;
@@ -1344,54 +1393,117 @@ async function publishRoutesFallback(
 			})
 		);
 	}
-	// using Promise.all() here instead of queue.onIdle() to ensure
-	// we actually throw errors that occur within queued promises.
+
 	await Promise.all(queuePromises);
 
-	// Deploy each route that is not already deployed.
-	for (const [routePattern, zoneId] of routesToDeploy.entries()) {
-		if (allRoutes.has(routePattern)) {
-			const knownScript = allRoutes.get(routePattern);
-			if (knownScript === scriptName) {
-				// This route is already associated with this worker, so no need to hit the API.
-				alreadyDeployedRoutes.delete(routePattern);
-				continue;
-			} else {
-				throw new UserError(
-					`The route with pattern "${routePattern}" is already associated with another worker called "${knownScript}".`,
-					{ telemetryMessage: "route already associated with another worker" }
-				);
-			}
+	for (const [zoneId] of zonesToInspect) {
+		const desiredPatterns = desiredRoutesByZone.get(zoneId) ?? [];
+		const existingRoutes = existingRoutesByZone.get(zoneId) ?? [];
+		const { toCreate, toDelete, toUpdate, deployed } = planZoneRouteChanges(
+			desiredPatterns,
+			existingRoutes,
+			scriptName
+		);
+		deployedRoutes.push(...deployed);
+
+		for (const route of toUpdate) {
+			await fetchResult<WorkerRouteWithZone>(
+				complianceConfig,
+				`/zones/${zoneId}/workers/routes/${route.id}`,
+				{
+					method: "PUT",
+					body: JSON.stringify({
+						pattern: route.pattern,
+						script: scriptName,
+					}),
+					headers: {
+						"Content-Type": "application/json",
+					},
+				}
+			);
 		}
 
-		const { pattern } = await fetchResult<{ pattern: string }>(
-			complianceConfig,
-			`/zones/${zoneId}/workers/routes`,
-			{
+		for (const pattern of toCreate) {
+			const { pattern: createdPattern } = await fetchResult<{
+				pattern: string;
+			}>(complianceConfig, `/zones/${zoneId}/workers/routes`, {
 				method: "POST",
 				body: JSON.stringify({
-					pattern: routePattern,
+					pattern,
 					script: scriptName,
 				}),
 				headers: {
 					"Content-Type": "application/json",
 				},
-			}
-		);
+			});
+			deployedRoutes.push(createdPattern);
+		}
 
-		deployedRoutes.push(pattern);
-	}
-
-	if (alreadyDeployedRoutes.size) {
-		logger.warn(
-			"Previously deployed routes:\n" +
-				"The following routes were already associated with this worker, and have not been deleted:\n" +
-				[...alreadyDeployedRoutes.values()].map((route) => ` - "${route}"\n`) +
-				"If these routes are not wanted then you can remove them in the dashboard."
-		);
+		for (const routeId of toDelete) {
+			await fetchResult(
+				complianceConfig,
+				`/zones/${zoneId}/workers/routes/${routeId}`,
+				{ method: "DELETE" }
+			);
+		}
 	}
 
 	return deployedRoutes;
+}
+
+function planZoneRouteChanges(
+	desiredPatterns: string[],
+	existingRoutes: WorkerRouteWithZone[],
+	scriptName: string
+) {
+	const deployed: string[] = [];
+	const toCreate: string[] = [];
+	const toDelete: string[] = [];
+	const toUpdate: Array<{ id: string; pattern: string }> = [];
+
+	const matchedRouteIds = new Set<string>();
+
+	for (const pattern of desiredPatterns) {
+		const existingMatch = existingRoutes.find(
+			(route) => route.pattern === pattern
+		);
+		if (existingMatch) {
+			if (existingMatch.script !== scriptName) {
+				throw new UserError(
+					`The route with pattern "${pattern}" is already associated with another worker called "${existingMatch.script}".`,
+					{ telemetryMessage: "route already associated with another worker" }
+				);
+			}
+			matchedRouteIds.add(existingMatch.id);
+			deployed.push(pattern);
+		}
+	}
+
+	const reusableRoutes = existingRoutes.filter(
+		(route) => route.script === scriptName && !matchedRouteIds.has(route.id)
+	);
+	const unmatchedDesired = desiredPatterns.filter(
+		(pattern) => !deployed.includes(pattern)
+	);
+
+	for (const pattern of unmatchedDesired) {
+		const routeToUpdate = reusableRoutes.shift();
+		if (routeToUpdate) {
+			toUpdate.push({ id: routeToUpdate.id, pattern });
+			deployed.push(pattern);
+		} else {
+			toCreate.push(pattern);
+		}
+	}
+
+	const updatedRouteIds = new Set(toUpdate.map((route) => route.id));
+	for (const route of reusableRoutes) {
+		if (!updatedRouteIds.has(route.id)) {
+			toDelete.push(route.id);
+		}
+	}
+
+	return { toCreate, toDelete, toUpdate, deployed };
 }
 
 export function isAuthenticationError(e: unknown): e is ParseError {

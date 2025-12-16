@@ -12,19 +12,22 @@ export function mockGetZoneWorkerRoutesMulti(
 	msw.use(
 		http.get<{ zoneId: string }>(
 			"*/zones/:zoneId/workers/routes",
-			({ params }) => {
-				expect(Object.keys(zones)).toContain(params.zoneId);
-				const routes = zones[params.zoneId] ?? [];
-				return HttpResponse.json(
-					{
-						success: true,
-						errors: [],
-						messages: [],
-						result: routes,
-					},
-					{ status: 200 }
-				);
-			},
+		({ params }) => {
+			expect(Object.keys(zones)).toContain(params.zoneId);
+			const routes = (zones[params.zoneId] ?? []).map((route, index) => ({
+				id: route.id ?? `route-${index}`,
+				...route,
+			}));
+			return HttpResponse.json(
+				{
+					success: true,
+					errors: [],
+					messages: [],
+					result: routes,
+				},
+				{ status: 200 }
+			);
+		},
 			options
 		)
 	);

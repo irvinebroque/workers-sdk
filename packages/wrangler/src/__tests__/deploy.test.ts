@@ -1686,15 +1686,8 @@ describe("deploy", () => {
 				Existing routes for this Worker in such zones will not be deleted."
 			`);
 			expect(std.err).toMatchInlineSnapshot(`""`);
-			expect(std.warn).toMatchInlineSnapshot(`
-				"[33m▲ [43;33m[[43;30mWARNING[43;33m][0m [1mPreviously deployed routes:[0m
+			expect(std.warn).toMatchInlineSnapshot(`""`);
 
-				  The following routes were already associated with this worker, and have not been deleted:
-				   - \\"foo.example.com/other-route\\"
-				  If these routes are not wanted then you can remove them in the dashboard.
-
-				"
-			`);
 			expect(std.out).toMatchInlineSnapshot(`
 				"
 				 ⛅️ wrangler x.x.x
@@ -1733,12 +1726,95 @@ describe("deploy", () => {
 				pattern: "example.com/some-route/*",
 				script: "test-name",
 			});
-			await expect(runWrangler("deploy ./index --env=staging")).rejects
-				.toThrowErrorMatchingInlineSnapshot(`
-				[Error: Service environments combined with an API token that doesn't have 'All Zones' permissions is not supported.
-				Either turn off service environments by setting \`legacy_env = true\`, creating an API token with 'All Zones' permissions, or logging in via OAuth]
-			`);
+		await expect(runWrangler("deploy ./index --env=staging")).rejects
+			.toThrowErrorMatchingInlineSnapshot(`
+			[Error: Service environments combined with an API token that doesn't have 'All Zones' permissions is not supported.
+			Either turn off service environments by setting \`legacy_env = true\`, creating an API token with 'All Zones' permissions, or logging in via OAuth]
+		`);
+	});
+
+	it("updates an existing route in place when the pattern changes", async () => {
+		writeWranglerConfig({
+			routes: ["example.com/foo/*"],
 		});
+		writeWorkerSource();
+		mockUpdateWorkerSubdomain({ enabled: false });
+		mockUploadWorkerRequest({ expectedType: "esm" });
+		mockGetZones("example.com", [{ id: "example-com-id" }]);
+		mockGetZoneWorkerRoutes("example-com-id", [
+			{
+				id: "existing-route-id",
+				pattern: "example.com/*",
+				script: "test-name",
+			},
+		]);
+
+		msw.use(
+			http.get(
+				"*/accounts/:accountId/workers/services/:scriptName/routes",
+				({ params }) => {
+					expect(params.accountId).toEqual("some-account-id");
+					expect(params.scriptName).toEqual("test-name");
+					return HttpResponse.json(
+						createFetchResult([
+							{
+								id: "existing-route-id",
+								pattern: "example.com/*",
+								script: "test-name",
+								zone_id: "example-com-id",
+							},
+						])
+					);
+				},
+				{ once: true }
+			)
+		);
+
+		let updateCount = 0;
+		let createCount = 0;
+		let deleteCount = 0;
+
+		msw.use(
+			http.put(
+				"*/zones/:zoneId/workers/routes/:routeId",
+				async ({ params, request }) => {
+					updateCount++;
+					expect(params.routeId).toEqual("existing-route-id");
+					const body = await request.json();
+					expect(body.pattern).toEqual("example.com/foo/*");
+					expect(body.script).toEqual("test-name");
+					return HttpResponse.json(
+						createFetchResult({
+							id: params.routeId as string,
+							pattern: body.pattern,
+							script: body.script,
+						})
+					);
+				}
+			)
+		);
+
+		msw.use(
+			http.post("*/zones/:zoneId/workers/routes", () => {
+				createCount++;
+				return HttpResponse.json(createFetchResult(null));
+			})
+		);
+
+		msw.use(
+			http.delete("*/zones/:zoneId/workers/routes/:routeId", () => {
+				deleteCount++;
+				return HttpResponse.json(createFetchResult(null));
+			})
+		);
+
+		await runWrangler("deploy ./index");
+
+		expect(updateCount).toBe(1);
+		expect(createCount).toBe(0);
+		expect(deleteCount).toBe(0);
+		expect(std.out).toContain("example.com/foo/*");
+	});
 
 		describe("custom domains", () => {
 			it("should deploy routes marked with 'custom_domain' as separate custom domains", async () => {
@@ -16086,10 +16162,12 @@ function mockPublishSchedulesRequest({
 
 function mockPublishRoutesRequest({
 	routes = [],
+	existingRoutes = [],
 	env = undefined,
 	useServiceEnvironments = true,
 }: {
 	routes: Config["routes"];
+	existingRoutes?: { pattern: string; id?: string; zone_id?: string }[];
 	env?: string | undefined;
 	useServiceEnvironments?: boolean | undefined;
 }) {
@@ -16097,27 +16175,75 @@ function mockPublishRoutesRequest({
 		env && useServiceEnvironments ? "services" : "scripts";
 	const environment =
 		env && useServiceEnvironments ? "/environments/:envName" : "";
+	const expectedScriptName =
+		!useServiceEnvironments && env ? `test-name-${env}` : "test-name";
 
 	msw.use(
-		http.put(
+		http.get(
 			`*/accounts/:accountId/workers/${servicesOrScripts}/:scriptName${environment}/routes`,
-			async ({ request, params }) => {
+			async ({ params }) => {
 				expect(params.accountId).toEqual("some-account-id");
-				expect(params.scriptName).toEqual(
-					!useServiceEnvironments && env ? `test-name-${env}` : "test-name"
-				);
+				expect(params.scriptName).toEqual(expectedScriptName);
 				if (useServiceEnvironments) {
 					expect(params.envName).toEqual(env);
 				}
-				const body = await request.json();
-				expect(body).toEqual(
-					routes.map((route) =>
-						typeof route !== "object" ? { pattern: route } : route
+				return HttpResponse.json(
+					createFetchResult(
+						existingRoutes.map((route) => ({
+							script: expectedScriptName,
+							...route,
+						}))
 					)
 				);
-				return HttpResponse.json(createFetchResult(null));
 			},
 			{ once: true }
+		)
+	);
+
+	msw.use(
+		http.post(
+			"*/zones/:zoneId/workers/routes",
+			async ({ request }) => {
+				const body = await request.json();
+				expect(body.script).toEqual(expectedScriptName);
+				if (routes.length > 0) {
+					const patterns = routes.map((route) =>
+						typeof route === "string" ? route : route.pattern
+					);
+					expect(patterns).toContain(body.pattern);
+				}
+				return HttpResponse.json(
+					createFetchResult({
+						id: `${body.pattern}-id`,
+						pattern: body.pattern,
+						script: body.script,
+					})
+				);
+			}
+		)
+	);
+
+	msw.use(
+		http.put(
+			"*/zones/:zoneId/workers/routes/:routeId",
+			async ({ request, params }) => {
+				expect(params.routeId).toBeDefined();
+				const body = await request.json();
+				expect(body.script).toEqual(expectedScriptName);
+				return HttpResponse.json(
+					createFetchResult({
+						id: params.routeId as string,
+						pattern: body.pattern,
+						script: body.script,
+					})
+				);
+			}
+		)
+	);
+
+	msw.use(
+		http.delete("*/zones/:zoneId/workers/routes/:routeId", () =>
+			HttpResponse.json(createFetchResult(null))
 		)
 	);
 }
@@ -16135,15 +16261,14 @@ function mockUnauthorizedPublishRoutesRequest({
 		env && useServiceEnvironments ? "/environments/:envName" : "";
 
 	msw.use(
-		http.put(
+		http.get(
 			`*/accounts/:accountId/workers/${servicesOrScripts}/:scriptName${environment}/routes`,
-			() => {
-				return HttpResponse.json(
+			() =>
+				HttpResponse.json(
 					createFetchResult(null, false, [
 						{ message: "Authentication error", code: 10000 },
 					])
-				);
-			},
+				),
 			{ once: true }
 		)
 	);
@@ -16153,6 +16278,18 @@ function mockPublishRoutesFallbackRequest(route: {
 	pattern: string;
 	script: string;
 }) {
+	msw.use(
+		http.put(
+			`*/zones/:zoneId/workers/routes/:routeId`,
+			async ({ request }) => {
+				const body = await request.json();
+				expect(body).toEqual(route);
+				return HttpResponse.json(createFetchResult(route.pattern));
+			},
+			{ once: true }
+		)
+	);
+
 	msw.use(
 		http.post(
 			`*/zones/:zoneId/workers/routes`,
