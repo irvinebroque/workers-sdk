@@ -131,6 +131,7 @@ describe("match-tag", () => {
 				`
 				[Error: An error occurred while trying to validate that the Worker name matches what is expected by the build system.
 				A request to the Cloudflare API (/accounts/some-account-id/workers/services/auth-error-worker) failed.
+				Status 401
 				Authentication error [code: 10000]]
 			`
 			);
@@ -206,6 +207,7 @@ describe("match-tag", () => {
 					`
 					[Error: An error occurred while trying to validate that the Worker name matches what is expected by the build system.
 					A request to the Cloudflare API (/accounts/some-account-id/workers/services/auth-error-worker) failed.
+					Status 401
 					Authentication error [code: 10000]]
 				`
 				);
