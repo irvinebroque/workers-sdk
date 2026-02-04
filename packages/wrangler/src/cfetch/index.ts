@@ -220,9 +220,11 @@ function throwFetchError(
 		maybeThrowFriendlyError(error);
 	}
 
+	const statusNote = status >= 400 ? [{ text: `Status ${status}` }] : [];
 	const error = new APIError({
 		text: `A request to the Cloudflare API (${resource}) failed.`,
 		notes: [
+			...statusNote,
 			...response.errors.map((err) => ({ text: renderError(err) })),
 			...(response.messages?.map((text) => ({ text })) ?? []),
 		],

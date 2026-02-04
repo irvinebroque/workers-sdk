@@ -847,6 +847,7 @@ describe("pages download config", () => {
 			  "debug": "",
 			  "err": "[31mX [41;31m[[41;97mERROR[41;31m][0m [1mA request to the Cloudflare API (/accounts/MOCK_ACCOUNT_ID/pages/projects/NOT_REAL) failed.[0m
 
+			  Status 404
 			  Project not found. The specified project name does not match any of your existing projects. [code:
 			  8000007]
 
