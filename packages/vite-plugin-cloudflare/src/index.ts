@@ -48,14 +48,7 @@ export function getLocalWorkerdCompatibilityDate(_options?: {
 	return { date: DEFAULT_COMPAT_DATE, source: "workerd" };
 }
 
-export type {
-	PluginConfig,
-	TunnelConfig,
-	TunnelKind,
-	TunnelMode,
-	TunnelReadyContext,
-} from "./plugin-config";
-export { DEFAULT_TUNNEL_URL_ENV } from "./plugin-config";
+export type { PluginConfig, TunnelConfig } from "./plugin-config";
 export type { WorkerConfig } from "./workers-configs";
 
 const sharedContext: SharedContext = {

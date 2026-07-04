@@ -29,7 +29,7 @@ Full documentation can be found [here](https://developers.cloudflare.com/workers
 
 ## Access the tunnel URL programmatically
 
-Use `tunnel.autoStart` when another tool needs a public URL as soon as the dev server starts. When `env` is omitted, the primary public URL is published to `process.env.CLOUDFLARE_TUNNEL_URL`:
+Use `tunnel.autoStart` when another tool needs a public URL as soon as the dev server starts. The primary public URL is published to `process.env.CLOUDFLARE_TUNNEL_URL` after the tunnel is ready:
 
 ```ts
 cloudflare({
@@ -39,45 +39,28 @@ cloudflare({
 });
 ```
 
-When you need a custom environment variable name, use `tunnel.env` to write the primary public tunnel URL to `process.env` after the tunnel is ready:
+This is useful for tools that launch remote browsers, webhooks, OAuth callbacks, and device testing. For example, Vitest Browser Mode can read the public origin from `CLOUDFLARE_TUNNEL_URL`:
 
 ```ts
 cloudflare({
   tunnel: {
     autoStart: true,
-    env: "PUBLIC_TUNNEL_URL",
   },
 });
 ```
 
-This is useful for tools that launch remote browsers, webhooks, OAuth callbacks, and device testing. For example, Vitest Browser Mode can read the public origin from `VITEST_BROWSER_PUBLIC_ORIGIN`:
-
-```ts
-cloudflare({
-  tunnel: {
-    autoStart: true,
-    env: "VITEST_BROWSER_PUBLIC_ORIGIN",
-  },
-});
-```
-
-Use `tunnel.onReady` when you need structured tunnel metadata or every URL from a named tunnel:
+Named tunnels also publish the first resolved public URL to `CLOUDFLARE_TUNNEL_URL`:
 
 ```ts
 cloudflare({
   tunnel: {
     autoStart: true,
     name: "my-tunnel",
-    env: ["PUBLIC_DEV_ORIGIN", "VITEST_BROWSER_PUBLIC_ORIGIN"],
-    onReady({ url, urls, mode, kind }) {
-      console.log(`Tunnel ready for ${mode}: ${url}`);
-      console.log(`Tunnel kind: ${kind}; URLs: ${urls.join(", ")}`);
-    },
   },
 });
 ```
 
-The tunnel URL is public. For named tunnels with multiple hostnames, `env` receives `context.url`, the first URL; `onReady` receives every URL in `context.urls`. Environment variables are not removed when the tunnel closes.
+The tunnel URL is public. Environment variables are not removed when the tunnel closes.
 
 ## Use cases
 

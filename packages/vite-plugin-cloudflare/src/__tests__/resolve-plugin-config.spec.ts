@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { removeDirSync } from "@cloudflare/workers-utils";
 import { afterEach, assert, beforeEach, describe, test, vi } from "vitest";
-import { DEFAULT_TUNNEL_URL_ENV, resolvePluginConfig } from "../plugin-config";
+import { resolvePluginConfig } from "../plugin-config";
 import type {
 	AssetsOnlyResolvedConfig,
 	PluginConfig,
@@ -40,7 +40,7 @@ describe("resolvePluginConfig - auxiliary workers", () => {
 		return configPath;
 	}
 
-	test("should publish the default tunnel env when autoStart is true", async ({
+	test("should resolve tunnel options when autoStart is true", async ({
 		expect,
 	}) => {
 		const entryConfigPath = createEntryWorkerConfig(tempDir);
@@ -53,41 +53,24 @@ describe("resolvePluginConfig - auxiliary workers", () => {
 
 		expect(result.tunnel).toMatchObject({
 			autoStart: true,
-			env: DEFAULT_TUNNEL_URL_ENV,
 		});
 	});
 
-	test("should keep a custom tunnel env when autoStart is true", async ({
-		expect,
-	}) => {
+	test("should resolve named tunnel options", async ({ expect }) => {
 		const entryConfigPath = createEntryWorkerConfig(tempDir);
 
 		const result = await resolvePluginConfig(
-			{ configPath: entryConfigPath, tunnel: { autoStart: true, env: "PUBLIC_TUNNEL_URL" } },
+			{
+				configPath: entryConfigPath,
+				tunnel: { autoStart: true, name: "my-tunnel" },
+			},
 			{ root: tempDir },
 			viteEnv
 		);
 
 		expect(result.tunnel).toMatchObject({
 			autoStart: true,
-			env: "PUBLIC_TUNNEL_URL",
-		});
-	});
-
-	test("should not publish a tunnel env when env is false", async ({
-		expect,
-	}) => {
-		const entryConfigPath = createEntryWorkerConfig(tempDir);
-
-		const result = await resolvePluginConfig(
-			{ configPath: entryConfigPath, tunnel: { autoStart: true, env: false } },
-			{ root: tempDir },
-			viteEnv
-		);
-
-		expect(result.tunnel).toMatchObject({
-			autoStart: true,
-			env: false,
+			name: "my-tunnel",
 		});
 	});
 
@@ -104,7 +87,6 @@ describe("resolvePluginConfig - auxiliary workers", () => {
 
 		expect(result.tunnel).toEqual({
 			autoStart: true,
-			env: DEFAULT_TUNNEL_URL_ENV,
 		});
 	});
 

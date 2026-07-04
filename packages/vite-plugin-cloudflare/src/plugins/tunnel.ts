@@ -5,14 +5,9 @@ import colors from "picocolors";
 import encodeQR from "qr";
 import * as wrangler from "wrangler";
 import { assertIsNotPreview, assertIsPreview } from "../context";
+import { DEFAULT_TUNNEL_URL_ENV } from "../plugin-config";
 import { debuglog, createPlugin } from "../utils";
 import type { PluginContext } from "../context";
-import type {
-	TunnelConfig,
-	TunnelKind,
-	TunnelMode,
-	TunnelReadyContext,
-} from "../plugin-config";
 import type { Tunnel } from "@cloudflare/workers-utils";
 import type * as vite from "vite";
 
@@ -76,7 +71,6 @@ export const QUICK_TUNNEL_ALLOWED_HOST = ".trycloudflare.com";
 
 interface TunnelStartResult {
 	publicUrls: string[];
-	kind: TunnelKind;
 }
 
 export class TunnelManager {
@@ -234,14 +228,14 @@ export class TunnelManager {
 
 			if (result.mode === "named") {
 				const publicUrls = this.#publicUrls;
-				return publicUrls ? { publicUrls, kind: "named" } : null;
+				return publicUrls ? { publicUrls } : null;
 			}
 
 			const { publicUrl } = result;
 
 			debuglog("Tunnel is ready with public URL:", publicUrl);
 			this.#publicUrls = [publicUrl.toString()];
-			return { publicUrls: this.#publicUrls, kind: "quick" };
+			return { publicUrls: this.#publicUrls };
 		} catch (error) {
 			if (this.#tunnel !== tunnel) {
 				return null;
@@ -431,65 +425,13 @@ export async function resolvePreviewTunnelOrigin(server: vite.PreviewServer) {
 	);
 }
 
-function createTunnelReadyContext(options: {
-	publicUrls: string[];
-	origin: string;
-	mode: TunnelMode;
-	kind: TunnelKind;
-	name?: string;
-}): TunnelReadyContext {
-	const urls = [...options.publicUrls];
-	const url = urls[0];
+function publishDefaultTunnelUrl(publicUrls: string[]): void {
+	const url = publicUrls[0];
 	if (url === undefined) {
 		throw new Error("Tunnel did not provide any public URLs.");
 	}
 
-	const hostnames = urls.map((publicUrl) => {
-		return new URL(publicUrl).hostname;
-	});
-	const hostname = new URL(url).hostname;
-
-	return {
-		urls,
-		url,
-		hostnames,
-		hostname,
-		origin: options.origin,
-		mode: options.mode,
-		kind: options.kind,
-		name: options.name,
-	};
-}
-
-function publishTunnelEnv(env: TunnelConfig["env"], url: string): void {
-	if (!env) {
-		return;
-	}
-
-	const names = Array.isArray(env) ? env : [env];
-	for (const name of names) {
-		process.env[name] = url;
-	}
-}
-
-async function notifyTunnelReady(options: {
-	ctx: PluginContext;
-	publicUrls: string[];
-	origin: string;
-	mode: TunnelMode;
-	kind: TunnelKind;
-}): Promise<void> {
-	const tunnel = options.ctx.resolvedPluginConfig.tunnel;
-	const readyContext = createTunnelReadyContext({
-		publicUrls: options.publicUrls,
-		origin: options.origin,
-		mode: options.mode,
-		kind: options.kind,
-		name: tunnel.name,
-	});
-
-	publishTunnelEnv(tunnel.env, readyContext.url);
-	await tunnel.onReady?.(readyContext);
+	process.env[DEFAULT_TUNNEL_URL_ENV] = url;
 }
 
 export async function setupDevTunnel(
@@ -536,13 +478,9 @@ export async function setupDevTunnel(
 		await server.restart();
 	}
 
-	await notifyTunnelReady({
-		ctx,
-		publicUrls,
-		origin,
-		mode: "dev",
-		kind: result.kind,
-	});
+	if (tunnel.autoStart) {
+		publishDefaultTunnelUrl(publicUrls);
+	}
 
 	if (shortcutPressed) {
 		server.printUrls();
@@ -600,13 +538,9 @@ export async function setupPreviewTunnel(
 		return;
 	}
 
-	await notifyTunnelReady({
-		ctx,
-		publicUrls: result.publicUrls,
-		origin,
-		mode: "preview",
-		kind: result.kind,
-	});
+	if (tunnel.autoStart) {
+		publishDefaultTunnelUrl(result.publicUrls);
+	}
 
 	if (shortcutPressed) {
 		server.printUrls();

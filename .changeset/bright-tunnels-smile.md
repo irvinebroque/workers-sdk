@@ -2,6 +2,6 @@
 "@cloudflare/vite-plugin": minor
 ---
 
-Expose Cloudflare tunnel URLs programmatically
+Expose auto-start tunnel URLs through the default environment
 
-You can now configure `tunnel.env` to publish the primary public tunnel URL to `process.env` when the tunnel is ready, or use `tunnel.onReady` to receive structured tunnel metadata including all public URLs for named tunnels.
+Auto-started Vite plugin tunnels now publish their primary public tunnel URL to `process.env.CLOUDFLARE_TUNNEL_URL` when the tunnel is ready.

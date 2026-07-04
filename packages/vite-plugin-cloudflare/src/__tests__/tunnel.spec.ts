@@ -12,6 +12,7 @@ import {
 } from "vitest";
 import * as wrangler from "wrangler";
 import { PluginContext } from "../context";
+import { DEFAULT_TUNNEL_URL_ENV } from "../plugin-config";
 import {
 	QUICK_TUNNEL_ALLOWED_HOST,
 	resolveDevTunnelOrigin,
@@ -27,22 +28,10 @@ import type * as vite from "vite";
 vi.mock("@cloudflare/workers-utils");
 vi.mock("wrangler");
 
-const TEST_TUNNEL_ENV_KEYS = [
-	"PUBLIC_TUNNEL_URL",
-	"PUBLIC_TUNNEL_URL_A",
-	"PUBLIC_TUNNEL_URL_B",
-	"PUBLIC_TUNNEL_URL_AFTER_RESTART",
-	"PUBLIC_TUNNEL_URL_DISABLED",
-	"NAMED_TUNNEL_URL",
-	"PREVIEW_TUNNEL_URL",
-];
+const TEST_TUNNEL_ENV_KEYS = [DEFAULT_TUNNEL_URL_ENV];
 
 function getTestEnv(name: string): string | undefined {
 	return process.env[name];
-}
-
-function setTestEnv(name: string, value: string): void {
-	process.env[name] = value;
 }
 
 function createMockPluginContext(options: {
@@ -61,8 +50,6 @@ function createMockPluginContext(options: {
 			tunnel: {
 				autoStart: options.tunnel?.autoStart ?? false,
 				name: options.tunnel?.name,
-				env: options.tunnel?.env,
-				onReady: options.tunnel?.onReady,
 			},
 		},
 	});
@@ -160,13 +147,13 @@ describe("tunnel plugin", () => {
 		expect(infoLog).not.toContain("Tunnel:");
 	});
 
-	it("sets configured tunnel env var when the tunnel is ready", async ({
+	it("sets default tunnel env var when an auto-start tunnel is ready", async ({
 		expect,
 	}) => {
 		const server = await createServer();
 		const ctx = createMockPluginContext({
 			type: "workers",
-			tunnel: { autoStart: true, env: "PUBLIC_TUNNEL_URL" },
+			tunnel: { autoStart: true },
 		});
 		const tunnelManager = new TunnelManager(server.config.logger);
 		vi.spyOn(server, "restart").mockResolvedValue();
@@ -176,30 +163,24 @@ describe("tunnel plugin", () => {
 		await server.listen(0);
 		await setupDevTunnel(server, ctx, tunnelManager);
 
-		expect(getTestEnv("PUBLIC_TUNNEL_URL")).toBe(
+		expect(getTestEnv(DEFAULT_TUNNEL_URL_ENV)).toBe(
 			"https://example.trycloudflare.com/"
 		);
 	});
 
-	it("sets tunnel env var and calls onReady after restarting for allowed hosts", async ({
+	it("sets default tunnel env var after restarting for allowed hosts", async ({
 		expect,
 	}) => {
-		const onReady = vi.fn();
 		const server = await createServer();
 		const ctx = createMockPluginContext({
 			type: "workers",
-			tunnel: {
-				autoStart: true,
-				env: "PUBLIC_TUNNEL_URL_AFTER_RESTART",
-				onReady,
-			},
+			tunnel: { autoStart: true },
 		});
 		const tunnelManager = new TunnelManager(server.config.logger);
 		const events: string[] = [];
 		const restart = vi.spyOn(server, "restart").mockImplementation(async () => {
 			events.push("restart");
-			expect(getTestEnv("PUBLIC_TUNNEL_URL_AFTER_RESTART")).toBeUndefined();
-			expect(onReady).not.toHaveBeenCalled();
+			expect(getTestEnv(DEFAULT_TUNNEL_URL_ENV)).toBeUndefined();
 		});
 
 		onTestFinished(() => server.close());
@@ -209,45 +190,18 @@ describe("tunnel plugin", () => {
 
 		expect(restart).toHaveBeenCalledTimes(1);
 		expect(events).toEqual(["restart"]);
-		expect(getTestEnv("PUBLIC_TUNNEL_URL_AFTER_RESTART")).toBe(
-			"https://example.trycloudflare.com/"
-		);
-		expect(onReady).toHaveBeenCalledTimes(1);
-	});
-
-	it("sets multiple configured tunnel env vars", async ({ expect }) => {
-		const server = await createServer();
-		const ctx = createMockPluginContext({
-			type: "workers",
-			tunnel: {
-				autoStart: true,
-				env: ["PUBLIC_TUNNEL_URL_A", "PUBLIC_TUNNEL_URL_B"],
-			},
-		});
-		const tunnelManager = new TunnelManager(server.config.logger);
-		vi.spyOn(server, "restart").mockResolvedValue();
-
-		onTestFinished(() => server.close());
-
-		await server.listen(0);
-		await setupDevTunnel(server, ctx, tunnelManager);
-
-		expect(getTestEnv("PUBLIC_TUNNEL_URL_A")).toBe(
-			"https://example.trycloudflare.com/"
-		);
-		expect(getTestEnv("PUBLIC_TUNNEL_URL_B")).toBe(
+		expect(getTestEnv(DEFAULT_TUNNEL_URL_ENV)).toBe(
 			"https://example.trycloudflare.com/"
 		);
 	});
 
-	it("does not change env vars when tunnel env is false", async ({
+	it("does not set default tunnel env var for manually started tunnels", async ({
 		expect,
 	}) => {
-		setTestEnv("PUBLIC_TUNNEL_URL_DISABLED", "existing");
 		const server = await createServer();
 		const ctx = createMockPluginContext({
 			type: "workers",
-			tunnel: { autoStart: true, env: false },
+			tunnel: { autoStart: false },
 		});
 		const tunnelManager = new TunnelManager(server.config.logger);
 		vi.spyOn(server, "restart").mockResolvedValue();
@@ -257,38 +211,10 @@ describe("tunnel plugin", () => {
 		await server.listen(0);
 		await setupDevTunnel(server, ctx, tunnelManager);
 
-		expect(getTestEnv("PUBLIC_TUNNEL_URL_DISABLED")).toBe("existing");
+		expect(getTestEnv(DEFAULT_TUNNEL_URL_ENV)).toBeUndefined();
 	});
 
-	it("calls onReady with quick tunnel context", async ({ expect }) => {
-		const onReady = vi.fn();
-		const server = await createServer();
-		const ctx = createMockPluginContext({
-			type: "workers",
-			tunnel: { autoStart: true, onReady },
-		});
-		const tunnelManager = new TunnelManager(server.config.logger);
-		vi.spyOn(server, "restart").mockResolvedValue();
-
-		onTestFinished(() => server.close());
-
-		await server.listen(0);
-		await setupDevTunnel(server, ctx, tunnelManager);
-
-		expect(onReady).toHaveBeenCalledTimes(1);
-		expect(onReady).toHaveBeenCalledWith({
-			urls: ["https://example.trycloudflare.com/"],
-			url: "https://example.trycloudflare.com/",
-			hostnames: ["example.trycloudflare.com"],
-			hostname: "example.trycloudflare.com",
-			origin: server.resolvedUrls?.local?.[0] ?? "",
-			mode: "dev",
-			kind: "quick",
-			name: undefined,
-		});
-	});
-
-	it("publishes first named tunnel URL and calls onReady with all URLs", async ({
+	it("publishes first named tunnel URL to the default env var", async ({
 		expect,
 	}) => {
 		vi.mocked(wrangler.unstable_resolveNamedTunnel).mockResolvedValue({
@@ -303,15 +229,12 @@ describe("tunnel plugin", () => {
 			extendExpiry: vi.fn(),
 			dispose: vi.fn(),
 		});
-		const onReady = vi.fn();
 		const server = await createServer();
 		const ctx = createMockPluginContext({
 			type: "workers",
 			tunnel: {
 				autoStart: true,
 				name: "my-tunnel",
-				env: "NAMED_TUNNEL_URL",
-				onReady,
 			},
 		});
 		const tunnelManager = new TunnelManager(server.config.logger);
@@ -322,24 +245,10 @@ describe("tunnel plugin", () => {
 		await server.listen(0);
 		await setupDevTunnel(server, ctx, tunnelManager);
 
-		expect(getTestEnv("NAMED_TUNNEL_URL")).toBe("https://one.example.com");
-		expect(onReady).toHaveBeenCalledTimes(1);
-		expect(onReady).toHaveBeenCalledWith({
-			urls: ["https://one.example.com", "https://two.example.com"],
-			url: "https://one.example.com",
-			hostnames: ["one.example.com", "two.example.com"],
-			hostname: "one.example.com",
-			origin: server.resolvedUrls?.local?.[0] ?? "",
-			mode: "dev",
-			kind: "named",
-			name: "my-tunnel",
-		});
+		expect(getTestEnv(DEFAULT_TUNNEL_URL_ENV)).toBe("https://one.example.com");
 	});
 
-	it("publishes tunnel env and calls onReady in preview mode", async ({
-		expect,
-	}) => {
-		const onReady = vi.fn();
+	it("publishes default tunnel env in preview mode", async ({ expect }) => {
 		const previewServer = await preview({
 			preview: {
 				allowedHosts: [QUICK_TUNNEL_ALLOWED_HOST],
@@ -350,11 +259,7 @@ describe("tunnel plugin", () => {
 		);
 		const ctx = createMockPluginContext({
 			type: "preview",
-			tunnel: {
-				autoStart: true,
-				env: "PREVIEW_TUNNEL_URL",
-				onReady,
-			},
+			tunnel: { autoStart: true },
 		});
 
 		onTestFinished(() => previewServer.close());
@@ -362,20 +267,10 @@ describe("tunnel plugin", () => {
 		await setupPreviewTunnel(previewServer, ctx, tunnelManager);
 
 		const startTunnelCall = vi.mocked(startTunnel).mock.calls[0]?.[0];
-		expect(getTestEnv("PREVIEW_TUNNEL_URL")).toBe(
+		expect(getTestEnv(DEFAULT_TUNNEL_URL_ENV)).toBe(
 			"https://example.trycloudflare.com/"
 		);
-		expect(onReady).toHaveBeenCalledTimes(1);
-		expect(onReady).toHaveBeenCalledWith({
-			urls: ["https://example.trycloudflare.com/"],
-			url: "https://example.trycloudflare.com/",
-			hostnames: ["example.trycloudflare.com"],
-			hostname: "example.trycloudflare.com",
-			origin: startTunnelCall?.origin.toString(),
-			mode: "preview",
-			kind: "quick",
-			name: undefined,
-		});
+		expect(startTunnelCall?.origin.toString()).toBeDefined();
 	});
 
 	it("reuses the same tunnel when the origin is unchanged", async ({
@@ -494,9 +389,7 @@ describe("tunnel plugin", () => {
 		});
 	});
 
-	it("does not call onReady when a tunnel start result is ignored", async ({
-		expect,
-	}) => {
+	it("does not publish ignored tunnel start results", async ({ expect }) => {
 		const firstReady = createDeferred<{
 			mode: "quick";
 			publicUrl: URL;
@@ -518,10 +411,9 @@ describe("tunnel plugin", () => {
 				dispose: vi.fn(),
 			});
 
-		const onReady = vi.fn();
 		const ctx = createMockPluginContext({
 			type: "workers",
-			tunnel: { autoStart: true, onReady },
+			tunnel: { autoStart: true },
 		});
 		const server1 = await createServer();
 		const server2 = await createServer();
@@ -547,11 +439,8 @@ describe("tunnel plugin", () => {
 		});
 		await firstSetup;
 
-		expect(onReady).toHaveBeenCalledTimes(1);
-		expect(onReady).toHaveBeenCalledWith(
-			expect.objectContaining({
-				url: "https://bar.trycloudflare.com/",
-			})
+		expect(getTestEnv(DEFAULT_TUNNEL_URL_ENV)).toBe(
+			"https://bar.trycloudflare.com/"
 		);
 	});
 
@@ -642,28 +531,6 @@ describe("tunnel plugin", () => {
 		await plugin.configureServer(server);
 
 		await expect(() => server.listen(0)).rejects.toBe(tunnelError);
-		expect(close).toHaveBeenCalledTimes(1);
-		expect(server.httpServer?.listening).toBe(false);
-	});
-
-	it("rejects server.listen when onReady rejects", async ({ expect }) => {
-		const onReadyError = new Error("onReady failed");
-		const onReady = vi.fn().mockRejectedValue(onReadyError);
-		const server = await createServer();
-		const ctx = createMockPluginContext({
-			type: "workers",
-			tunnel: { autoStart: true, onReady },
-		});
-
-		const plugin = tunnelPlugin(ctx);
-		const close = vi.spyOn(server, "close");
-
-		onTestFinished(() => server.close());
-
-		// @ts-expect-error The tunnel plugin accepts a server instance directly without relying on `this`
-		await plugin.configureServer(server);
-
-		await expect(() => server.listen(0)).rejects.toBe(onReadyError);
 		expect(close).toHaveBeenCalledTimes(1);
 		expect(server.httpServer?.listening).toBe(false);
 	});
