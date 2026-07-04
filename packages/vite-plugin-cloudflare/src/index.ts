@@ -55,6 +55,7 @@ export type {
 	TunnelMode,
 	TunnelReadyContext,
 } from "./plugin-config";
+export { DEFAULT_TUNNEL_URL_ENV } from "./plugin-config";
 export type { WorkerConfig } from "./workers-configs";
 
 const sharedContext: SharedContext = {

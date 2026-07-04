@@ -40,6 +40,7 @@ import type { Unstable_Config } from "wrangler";
 export type PersistState = boolean | { path: string };
 export type TunnelMode = "dev" | "preview";
 export type TunnelKind = "quick" | "named";
+export const DEFAULT_TUNNEL_URL_ENV = "CLOUDFLARE_TUNNEL_URL";
 export interface TunnelReadyContext {
 	urls: string[];
 	url: string;
@@ -177,6 +178,26 @@ function normalizeNewConfig(
 	};
 }
 
+function resolveTunnelConfig(tunnel: PluginConfig["tunnel"]): TunnelConfig {
+	if (tunnel === "auto") {
+		return {
+			autoStart: !process.env[DEFAULT_TUNNEL_URL_ENV],
+			env: DEFAULT_TUNNEL_URL_ENV,
+		};
+	}
+
+	if (typeof tunnel === "boolean") {
+		return { autoStart: tunnel };
+	}
+
+	return {
+		autoStart: tunnel?.autoStart ?? false,
+		name: tunnel?.name,
+		env: tunnel?.env,
+		onReady: tunnel?.onReady,
+	};
+}
+
 type FilteredEntryWorkerConfig = Omit<
 	ResolvedAssetsOnlyConfig,
 	"topLevelName" | "name"
@@ -198,7 +219,7 @@ export interface PluginConfig extends EntryWorkerConfig {
 	persistState?: PersistState;
 	inspectorPort?: number | false;
 	remoteBindings?: boolean;
-	tunnel?: boolean | TunnelConfig;
+	tunnel?: boolean | "auto" | TunnelConfig;
 	experimental?: Experimental;
 }
 
@@ -423,15 +444,7 @@ export async function resolvePluginConfig(
 	const shared = {
 		persistState: pluginConfig.persistState ?? true,
 		inspectorPort: pluginConfig.inspectorPort,
-		tunnel:
-			typeof pluginConfig.tunnel === "boolean"
-				? { autoStart: pluginConfig.tunnel }
-				: {
-						autoStart: pluginConfig.tunnel?.autoStart ?? false,
-						name: pluginConfig.tunnel?.name,
-						env: pluginConfig.tunnel?.env,
-						onReady: pluginConfig.tunnel?.onReady,
-					},
+		tunnel: resolveTunnelConfig(pluginConfig.tunnel),
 		experimental: {
 			headersAndRedirectsDevModeSupport:
 				pluginConfig.experimental?.headersAndRedirectsDevModeSupport,
