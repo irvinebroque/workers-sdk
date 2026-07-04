@@ -40,14 +40,13 @@ describe("resolvePluginConfig - auxiliary workers", () => {
 		return configPath;
 	}
 
-	test("should resolve tunnel auto to auto-start and publish the default env", async ({
+	test("should publish the default tunnel env when autoStart is true", async ({
 		expect,
 	}) => {
-		vi.stubEnv(DEFAULT_TUNNEL_URL_ENV, undefined);
 		const entryConfigPath = createEntryWorkerConfig(tempDir);
 
 		const result = await resolvePluginConfig(
-			{ configPath: entryConfigPath, tunnel: "auto" },
+			{ configPath: entryConfigPath, tunnel: { autoStart: true } },
 			{ root: tempDir },
 			viteEnv
 		);
@@ -58,25 +57,41 @@ describe("resolvePluginConfig - auxiliary workers", () => {
 		});
 	});
 
-	test("should resolve tunnel auto without auto-start when the default env is set", async ({
+	test("should keep a custom tunnel env when autoStart is true", async ({
 		expect,
 	}) => {
-		vi.stubEnv(DEFAULT_TUNNEL_URL_ENV, "https://public.example.com");
 		const entryConfigPath = createEntryWorkerConfig(tempDir);
 
 		const result = await resolvePluginConfig(
-			{ configPath: entryConfigPath, tunnel: "auto" },
+			{ configPath: entryConfigPath, tunnel: { autoStart: true, env: "PUBLIC_TUNNEL_URL" } },
 			{ root: tempDir },
 			viteEnv
 		);
 
 		expect(result.tunnel).toMatchObject({
-			autoStart: false,
-			env: DEFAULT_TUNNEL_URL_ENV,
+			autoStart: true,
+			env: "PUBLIC_TUNNEL_URL",
 		});
 	});
 
-	test("should keep boolean tunnel config backward-compatible", async ({
+	test("should not publish a tunnel env when env is false", async ({
+		expect,
+	}) => {
+		const entryConfigPath = createEntryWorkerConfig(tempDir);
+
+		const result = await resolvePluginConfig(
+			{ configPath: entryConfigPath, tunnel: { autoStart: true, env: false } },
+			{ root: tempDir },
+			viteEnv
+		);
+
+		expect(result.tunnel).toMatchObject({
+			autoStart: true,
+			env: false,
+		});
+	});
+
+	test("should publish the default tunnel env for boolean tunnel config", async ({
 		expect,
 	}) => {
 		const entryConfigPath = createEntryWorkerConfig(tempDir);
@@ -87,7 +102,10 @@ describe("resolvePluginConfig - auxiliary workers", () => {
 			viteEnv
 		);
 
-		expect(result.tunnel).toEqual({ autoStart: true });
+		expect(result.tunnel).toEqual({
+			autoStart: true,
+			env: DEFAULT_TUNNEL_URL_ENV,
+		});
 	});
 
 	test("should resolve auxiliary worker from config file", async ({

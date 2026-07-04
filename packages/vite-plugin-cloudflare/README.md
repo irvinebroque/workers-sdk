@@ -29,10 +29,14 @@ Full documentation can be found [here](https://developers.cloudflare.com/workers
 
 ## Access the tunnel URL programmatically
 
-Use `tunnel: "auto"` when another tool needs a public URL and can read it from `process.env.CLOUDFLARE_TUNNEL_URL`. This starts a tunnel automatically unless `CLOUDFLARE_TUNNEL_URL` is already set:
+Use `tunnel.autoStart` when another tool needs a public URL as soon as the dev server starts. When `env` is omitted, the primary public URL is published to `process.env.CLOUDFLARE_TUNNEL_URL`:
 
 ```ts
-cloudflare({ tunnel: "auto" });
+cloudflare({
+  tunnel: {
+    autoStart: true,
+  },
+});
 ```
 
 When you need a custom environment variable name, use `tunnel.env` to write the primary public tunnel URL to `process.env` after the tunnel is ready:

@@ -179,23 +179,20 @@ function normalizeNewConfig(
 }
 
 function resolveTunnelConfig(tunnel: PluginConfig["tunnel"]): TunnelConfig {
-	if (tunnel === "auto") {
-		return {
-			autoStart: !process.env[DEFAULT_TUNNEL_URL_ENV],
-			env: DEFAULT_TUNNEL_URL_ENV,
-		};
+	const resolved: TunnelConfig = typeof tunnel === "boolean"
+		? { autoStart: tunnel }
+		: {
+				autoStart: tunnel?.autoStart ?? false,
+				name: tunnel?.name,
+				env: tunnel?.env,
+				onReady: tunnel?.onReady,
+			};
+
+	if (resolved.autoStart && resolved.env === undefined) {
+		resolved.env = DEFAULT_TUNNEL_URL_ENV;
 	}
 
-	if (typeof tunnel === "boolean") {
-		return { autoStart: tunnel };
-	}
-
-	return {
-		autoStart: tunnel?.autoStart ?? false,
-		name: tunnel?.name,
-		env: tunnel?.env,
-		onReady: tunnel?.onReady,
-	};
+	return resolved;
 }
 
 type FilteredEntryWorkerConfig = Omit<
@@ -219,7 +216,7 @@ export interface PluginConfig extends EntryWorkerConfig {
 	persistState?: PersistState;
 	inspectorPort?: number | false;
 	remoteBindings?: boolean;
-	tunnel?: boolean | "auto" | TunnelConfig;
+	tunnel?: boolean | TunnelConfig;
 	experimental?: Experimental;
 }
 
