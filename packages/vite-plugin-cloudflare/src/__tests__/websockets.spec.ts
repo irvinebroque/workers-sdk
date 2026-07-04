@@ -12,6 +12,7 @@ import {
 } from "vitest";
 import { handleWebSocket } from "../websockets";
 import type { AddressInfo } from "node:net";
+import type { Duplex } from "node:stream";
 
 describe("handleWebSocket", () => {
 	let httpServer: http.Server;
@@ -36,6 +37,65 @@ describe("handleWebSocket", () => {
 		handleWebSocket(httpServer, miniflare, entryWorkerName);
 		await new Promise<void>((r) => httpServer.listen(0, "127.0.0.1", r));
 		port = (httpServer.address() as AddressInfo).port;
+	}
+
+	async function connectUpgradeSocket(options?: {
+		path?: string;
+		headers?: Record<string, string>;
+	}) {
+		const socket = net.connect(port, "127.0.0.1");
+		socket.on("error", () => {});
+		await new Promise<void>((r) => socket.on("connect", r));
+
+		const headers = {
+			Host: `127.0.0.1:${port}`,
+			...options?.headers,
+		};
+		const headerLines = Object.entries(headers)
+			.map(([key, value]) => `${key}: ${value}`)
+			.join("\r\n");
+
+		socket.write(
+			`GET ${options?.path ?? "/"} HTTP/1.1\r\n` +
+				`${headerLines}\r\n` +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+				"Sec-WebSocket-Version: 13\r\n\r\n"
+		);
+
+		return socket;
+	}
+
+	async function expectUpgradePassesThrough(
+		expect: ExpectStatic,
+		options?: {
+			path?: string;
+			headers?: Record<string, string>;
+		}
+	) {
+		const mockedDispatchFetch = vi.spyOn(miniflare, "dispatchFetch");
+		let serverSocket: Duplex | undefined;
+		let serverSocketDestroyed = true;
+		const passThroughSeen = new Promise<void>((resolve) => {
+			httpServer.once("upgrade", (_request, upgradedSocket) => {
+				serverSocket = upgradedSocket;
+				setImmediate(() => {
+					serverSocketDestroyed = upgradedSocket.destroyed;
+					resolve();
+				});
+			});
+		});
+
+		const socket = await connectUpgradeSocket(options);
+		await passThroughSeen;
+
+		expect(mockedDispatchFetch).not.toHaveBeenCalled();
+		expect(serverSocketDestroyed).toBe(false);
+		expect(socket.destroyed).toBe(false);
+
+		serverSocket?.destroy();
+		socket.destroy();
 	}
 
 	afterEach(async () => {
@@ -74,6 +134,62 @@ describe("handleWebSocket", () => {
 		// Verify server did not crash and is still responsive
 		const response = await fetch(`http://127.0.0.1:${port}`);
 		expect(response.ok).toBe(true);
+	});
+
+	test("passes through Vite HMR requests outside sandbox origins", async ({
+		expect,
+	}) => {
+		await listen();
+
+		await expectUpgradePassesThrough(expect, {
+			headers: {
+				"Sec-WebSocket-Protocol": "vite-hmr",
+			},
+		});
+	});
+
+	test("passes through Vitest Browser RPC requests by subprotocol", async ({
+		expect,
+	}) => {
+		await listen();
+
+		await expectUpgradePassesThrough(expect, {
+			headers: {
+				"Sec-WebSocket-Protocol": "vitest-browser-rpc",
+			},
+		});
+	});
+
+	test("passes through Vitest Browser RPC requests by pathname", async ({
+		expect,
+	}) => {
+		await listen();
+
+		await expectUpgradePassesThrough(expect, {
+			path: "/__vitest_browser_api__",
+		});
+	});
+
+	test("dispatches ordinary Worker WebSocket upgrades", async ({ expect }) => {
+		await listen();
+
+		const deferred = new DeferredPromise<Response>();
+		const mockedDispatchFetch = vi
+			.spyOn(miniflare, "dispatchFetch")
+			.mockReturnValue(deferred);
+
+		const socket = await connectUpgradeSocket({ path: "/worker-websocket" });
+
+		await vi.waitFor(() => expect(miniflare.dispatchFetch).toHaveBeenCalled());
+
+		// Resolve the mock so miniflare.dispose() doesn't hang in afterEach
+		deferred.resolve(new Response(null));
+
+		socket.destroy();
+
+		assert(mockedDispatchFetch.mock.lastCall);
+		const [url] = mockedDispatchFetch.mock.lastCall;
+		expect(`${url}`).toBe(`http://127.0.0.1:${port}/worker-websocket`);
 	});
 
 	test("forwards sandbox requests", async ({ expect }) => {

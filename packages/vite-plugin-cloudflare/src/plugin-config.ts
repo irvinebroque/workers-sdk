@@ -38,6 +38,7 @@ import type { RawConfig } from "@cloudflare/workers-utils";
 import type { Unstable_Config } from "wrangler";
 
 export type PersistState = boolean | { path: string };
+export const DEFAULT_TUNNEL_URL_ENV = "CLOUDFLARE_TUNNEL_URL";
 export type TunnelConfig = {
 	autoStart?: boolean;
 	name?: string;
@@ -161,6 +162,15 @@ function normalizeNewConfig(
 		types: { generate: option.types?.generate ?? true },
 		cfBuildOutput: option.cfBuildOutput ?? false,
 	};
+}
+
+function resolveTunnelConfig(tunnel: PluginConfig["tunnel"]): TunnelConfig {
+	return typeof tunnel === "boolean"
+		? { autoStart: tunnel }
+		: {
+				autoStart: tunnel?.autoStart ?? false,
+				name: tunnel?.name,
+			};
 }
 
 type FilteredEntryWorkerConfig = Omit<
@@ -409,13 +419,7 @@ export async function resolvePluginConfig(
 	const shared = {
 		persistState: pluginConfig.persistState ?? true,
 		inspectorPort: pluginConfig.inspectorPort,
-		tunnel:
-			typeof pluginConfig.tunnel === "boolean"
-				? { autoStart: pluginConfig.tunnel }
-				: {
-						autoStart: pluginConfig.tunnel?.autoStart ?? false,
-						name: pluginConfig.tunnel?.name,
-					},
+		tunnel: resolveTunnelConfig(pluginConfig.tunnel),
 		experimental: {
 			headersAndRedirectsDevModeSupport:
 				pluginConfig.experimental?.headersAndRedirectsDevModeSupport,

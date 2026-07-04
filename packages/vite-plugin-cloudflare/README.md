@@ -27,6 +27,41 @@ Full documentation can be found [here](https://developers.cloudflare.com/workers
 - Leverages Vite's hot module replacement for consistently fast updates
 - Supports `vite preview` for previewing your build output in the Workers runtime prior to deployment
 
+## Access the tunnel URL programmatically
+
+Use `tunnel.autoStart` when another tool needs a public URL as soon as the dev server starts. The primary public URL is published to `process.env.CLOUDFLARE_TUNNEL_URL` after the tunnel is ready:
+
+```ts
+cloudflare({
+  tunnel: {
+    autoStart: true,
+  },
+});
+```
+
+This is useful for tools that launch remote browsers, webhooks, OAuth callbacks, and device testing. For example, Vitest Browser Mode can read the public origin from `CLOUDFLARE_TUNNEL_URL`:
+
+```ts
+cloudflare({
+  tunnel: {
+    autoStart: true,
+  },
+});
+```
+
+Named tunnels also publish the first resolved public URL to `CLOUDFLARE_TUNNEL_URL`:
+
+```ts
+cloudflare({
+  tunnel: {
+    autoStart: true,
+    name: "my-tunnel",
+  },
+});
+```
+
+The tunnel URL is public. Environment variables are not removed when the tunnel closes.
+
 ## Use cases
 
 - [TanStack Start](https://tanstack.com/start/)

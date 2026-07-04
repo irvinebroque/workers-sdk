@@ -12,11 +12,13 @@ const DEFAULT_TUNNEL_EXPIRY_MS = 60 * 60 * 1_000;
 const DEFAULT_TUNNEL_EXTENSION_MS = 60 * 60 * 1_000;
 const DEFAULT_TUNNEL_MAX_REMAINING_MS = 3 * 60 * 60 * 1_000;
 const DEFAULT_TUNNEL_REMINDER_INTERVAL_MS = 10 * 60 * 1_000;
+const QUICK_TUNNEL_PROPAGATION_DELAY_MS = 10_000;
 
 /**
  * cloudflared logs the quick tunnel URL to stderr.
  */
 const QUICK_TUNNEL_URL_REGEX = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
+const TUNNEL_CONNECTION_READY_REGEX = /\bRegistered tunnel connection\b/;
 
 export interface QuickTunnelResult {
 	mode: "quick";
@@ -47,12 +49,12 @@ export interface TunnelOptions {
 }
 
 /**
- * Start a Cloudflare Quick Tunnel for a local dev origin.
+ * Start a Cloudflare Tunnel for a local dev origin.
  *
- * Spawns `cloudflared tunnel --url <origin>` and waits for the public URL
- * to appear in its stderr output. Returns a controller with a `ready()`
- * promise that resolves once the tunnel URL is available, and a `dispose()`
- * function to stop the tunnel.
+ * Spawns cloudflared and waits for it to register an edge connection. Quick
+ * tunnels also wait for the public URL to appear in stderr and a short
+ * propagation window before reporting readiness. Returns a controller with a
+ * `ready()` promise and a `dispose()` function to stop the tunnel.
  */
 export function startTunnel(options: TunnelOptions): Tunnel {
 	let disposed = false;
@@ -90,16 +92,13 @@ export function startTunnel(options: TunnelOptions): Tunnel {
 	});
 
 	const readyPromise = cloudflaredPromise
-		.then((process) => {
-			if (isNamedTunnel) {
-				return { mode: "named" } as const;
-			}
-
-			return waitForQuickTunnelReady(process, timeoutMs, {
+		.then((process) =>
+			waitForTunnelReady(process, timeoutMs, {
 				logger,
 				origin: options.origin,
-			});
-		})
+				isNamedTunnel,
+			})
+		)
 		.then((result) => {
 			expiresAt = Date.now() + defaultExpiryMs;
 
@@ -246,21 +245,67 @@ function terminateCloudflared(cloudflared: ChildProcess) {
 	forceKillTimer.unref();
 }
 
-function waitForQuickTunnelReady(
+function waitForTunnelReady(
 	cloudflared: ChildProcess,
 	timeoutMs: number,
-	options: { logger?: Pick<Logger, "debug" | "log" | "warn">; origin: URL }
+	options: {
+		logger?: Pick<Logger, "debug" | "log" | "warn">;
+		origin: URL;
+		isNamedTunnel: boolean;
+	}
 ): Promise<TunnelResult> {
 	return new Promise<TunnelResult>((resolve, reject) => {
 		let resolved = false;
+		let hasRegisteredConnection = false;
+		let publicUrl: URL | undefined;
+		let propagationTimeoutId: ReturnType<typeof setTimeout> | undefined;
 		let stderrOutput = "";
 		const logger = options?.logger;
 		const origin = options?.origin;
+		const isNamedTunnel = options?.isNamedTunnel;
+
+		function resolveReady(result: TunnelResult) {
+			resolved = true;
+			clearTimeout(timeoutId);
+			if (propagationTimeoutId) {
+				clearTimeout(propagationTimeoutId);
+			}
+			resolve(result);
+		}
+
+		function rejectReady(error: Error) {
+			resolved = true;
+			clearTimeout(timeoutId);
+			if (propagationTimeoutId) {
+				clearTimeout(propagationTimeoutId);
+			}
+			reject(error);
+		}
+
+		function maybeResolve() {
+			if (resolved || propagationTimeoutId || !hasRegisteredConnection) {
+				return;
+			}
+
+			if (isNamedTunnel) {
+				resolveReady({ mode: "named" });
+				return;
+			}
+
+			if (publicUrl) {
+				clearTimeout(timeoutId);
+				propagationTimeoutId = setTimeout(() => {
+					if (publicUrl) {
+						resolveReady({ mode: "quick", publicUrl });
+					}
+				}, QUICK_TUNNEL_PROPAGATION_DELAY_MS);
+			}
+		}
+
 		const timeoutId = setTimeout(() => {
 			if (!resolved) {
-				resolved = true;
 				terminateCloudflared(cloudflared);
-				reject(
+				rejectReady(
 					createTunnelStartupError(
 						`Timed out waiting for cloudflared to start (${timeoutMs / 1_000}s).`,
 						stderrOutput,
@@ -277,33 +322,32 @@ function waitForQuickTunnelReady(
 				stderrOutput += chunk;
 				logger?.debug("[cloudflared]", chunk.trimEnd());
 
-				const match = QUICK_TUNNEL_URL_REGEX.exec(stderrOutput);
-				if (match && !resolved) {
-					resolved = true;
-					clearTimeout(timeoutId);
-					resolve({ mode: "quick", publicUrl: new URL(match[0]) });
+				if (!isNamedTunnel && !publicUrl) {
+					const match = QUICK_TUNNEL_URL_REGEX.exec(stderrOutput);
+					if (match) {
+						publicUrl = new URL(match[0]);
+					}
 				}
+
+				hasRegisteredConnection ||=
+					TUNNEL_CONNECTION_READY_REGEX.test(stderrOutput);
+				maybeResolve();
 			});
 		}
 
 		cloudflared.on("error", (error) => {
 			if (!resolved) {
-				resolved = true;
-				clearTimeout(timeoutId);
-				reject(new Error(`Failed to start cloudflared: ${error.message}`));
+				rejectReady(new Error(`Failed to start cloudflared: ${error.message}`));
 			}
 		});
 
 		cloudflared.on("exit", (code, signal) => {
 			if (!resolved) {
-				resolved = true;
-				clearTimeout(timeoutId);
-
 				const reason = signal
 					? `terminated by signal ${signal}`
 					: `exited with code ${code}`;
 
-				reject(
+				rejectReady(
 					createTunnelStartupError(
 						`cloudflared ${reason} before the tunnel was ready.`,
 						stderrOutput,
