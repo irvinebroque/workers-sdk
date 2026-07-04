@@ -27,6 +27,23 @@ import type * as vite from "vite";
 vi.mock("@cloudflare/workers-utils");
 vi.mock("wrangler");
 
+const TEST_TUNNEL_ENV_KEYS = [
+	"PUBLIC_TUNNEL_URL",
+	"PUBLIC_TUNNEL_URL_A",
+	"PUBLIC_TUNNEL_URL_B",
+	"PUBLIC_TUNNEL_URL_DISABLED",
+	"NAMED_TUNNEL_URL",
+	"PREVIEW_TUNNEL_URL",
+];
+
+function getTestEnv(name: string): string | undefined {
+	return process.env[name];
+}
+
+function setTestEnv(name: string, value: string): void {
+	process.env[name] = value;
+}
+
 function createMockPluginContext(options: {
 	type: "workers" | "preview";
 	tunnel?: TunnelConfig;
@@ -43,6 +60,8 @@ function createMockPluginContext(options: {
 			tunnel: {
 				autoStart: options.tunnel?.autoStart ?? false,
 				name: options.tunnel?.name,
+				env: options.tunnel?.env,
+				onReady: options.tunnel?.onReady,
 			},
 		},
 	});
@@ -77,6 +96,9 @@ describe("tunnel plugin", () => {
 	});
 
 	afterEach(() => {
+		for (const key of TEST_TUNNEL_ENV_KEYS) {
+			delete process.env[key];
+		}
 		vi.resetAllMocks();
 	});
 
@@ -135,6 +157,190 @@ describe("tunnel plugin", () => {
 			.map(([message]) => stripVTControlCharacters(message))
 			.join("\n");
 		expect(infoLog).not.toContain("Tunnel:");
+	});
+
+	it("sets configured tunnel env var when the tunnel is ready", async ({
+		expect,
+	}) => {
+		const server = await createServer();
+		const ctx = createMockPluginContext({
+			type: "workers",
+			tunnel: { autoStart: true, env: "PUBLIC_TUNNEL_URL" },
+		});
+		const tunnelManager = new TunnelManager(server.config.logger);
+		vi.spyOn(server, "restart").mockResolvedValue();
+
+		onTestFinished(() => server.close());
+
+		await server.listen(0);
+		await setupDevTunnel(server, ctx, tunnelManager);
+
+		expect(getTestEnv("PUBLIC_TUNNEL_URL")).toBe(
+			"https://example.trycloudflare.com/"
+		);
+	});
+
+	it("sets multiple configured tunnel env vars", async ({ expect }) => {
+		const server = await createServer();
+		const ctx = createMockPluginContext({
+			type: "workers",
+			tunnel: {
+				autoStart: true,
+				env: ["PUBLIC_TUNNEL_URL_A", "PUBLIC_TUNNEL_URL_B"],
+			},
+		});
+		const tunnelManager = new TunnelManager(server.config.logger);
+		vi.spyOn(server, "restart").mockResolvedValue();
+
+		onTestFinished(() => server.close());
+
+		await server.listen(0);
+		await setupDevTunnel(server, ctx, tunnelManager);
+
+		expect(getTestEnv("PUBLIC_TUNNEL_URL_A")).toBe(
+			"https://example.trycloudflare.com/"
+		);
+		expect(getTestEnv("PUBLIC_TUNNEL_URL_B")).toBe(
+			"https://example.trycloudflare.com/"
+		);
+	});
+
+	it("does not change env vars when tunnel env is false", async ({
+		expect,
+	}) => {
+		setTestEnv("PUBLIC_TUNNEL_URL_DISABLED", "existing");
+		const server = await createServer();
+		const ctx = createMockPluginContext({
+			type: "workers",
+			tunnel: { autoStart: true, env: false },
+		});
+		const tunnelManager = new TunnelManager(server.config.logger);
+		vi.spyOn(server, "restart").mockResolvedValue();
+
+		onTestFinished(() => server.close());
+
+		await server.listen(0);
+		await setupDevTunnel(server, ctx, tunnelManager);
+
+		expect(getTestEnv("PUBLIC_TUNNEL_URL_DISABLED")).toBe("existing");
+	});
+
+	it("calls onReady with quick tunnel context", async ({ expect }) => {
+		const onReady = vi.fn();
+		const server = await createServer();
+		const ctx = createMockPluginContext({
+			type: "workers",
+			tunnel: { autoStart: true, onReady },
+		});
+		const tunnelManager = new TunnelManager(server.config.logger);
+		vi.spyOn(server, "restart").mockResolvedValue();
+
+		onTestFinished(() => server.close());
+
+		await server.listen(0);
+		await setupDevTunnel(server, ctx, tunnelManager);
+
+		expect(onReady).toHaveBeenCalledTimes(1);
+		expect(onReady).toHaveBeenCalledWith({
+			urls: ["https://example.trycloudflare.com/"],
+			url: "https://example.trycloudflare.com/",
+			hostnames: ["example.trycloudflare.com"],
+			hostname: "example.trycloudflare.com",
+			origin: server.resolvedUrls?.local?.[0] ?? "",
+			mode: "dev",
+			kind: "quick",
+			name: undefined,
+		});
+	});
+
+	it("publishes first named tunnel URL and calls onReady with all URLs", async ({
+		expect,
+	}) => {
+		vi.mocked(wrangler.unstable_resolveNamedTunnel).mockResolvedValue({
+			hostnames: ["one.example.com", "two.example.com"],
+			token: "TOKEN",
+		});
+		vi.mocked(startTunnel).mockReturnValue({
+			ready: vi.fn().mockResolvedValue({
+				mode: "named",
+			}),
+			isOpen: vi.fn(() => true),
+			extendExpiry: vi.fn(),
+			dispose: vi.fn(),
+		});
+		const onReady = vi.fn();
+		const server = await createServer();
+		const ctx = createMockPluginContext({
+			type: "workers",
+			tunnel: {
+				autoStart: true,
+				name: "my-tunnel",
+				env: "NAMED_TUNNEL_URL",
+				onReady,
+			},
+		});
+		const tunnelManager = new TunnelManager(server.config.logger);
+		vi.spyOn(server, "restart").mockResolvedValue();
+
+		onTestFinished(() => server.close());
+
+		await server.listen(0);
+		await setupDevTunnel(server, ctx, tunnelManager);
+
+		expect(getTestEnv("NAMED_TUNNEL_URL")).toBe("https://one.example.com");
+		expect(onReady).toHaveBeenCalledTimes(1);
+		expect(onReady).toHaveBeenCalledWith({
+			urls: ["https://one.example.com", "https://two.example.com"],
+			url: "https://one.example.com",
+			hostnames: ["one.example.com", "two.example.com"],
+			hostname: "one.example.com",
+			origin: server.resolvedUrls?.local?.[0] ?? "",
+			mode: "dev",
+			kind: "named",
+			name: "my-tunnel",
+		});
+	});
+
+	it("publishes tunnel env and calls onReady in preview mode", async ({
+		expect,
+	}) => {
+		const onReady = vi.fn();
+		const previewServer = await preview({
+			preview: {
+				allowedHosts: [QUICK_TUNNEL_ALLOWED_HOST],
+			},
+		});
+		const tunnelManager = new TunnelManager(
+			previewServer.config.logger as vite.Logger
+		);
+		const ctx = createMockPluginContext({
+			type: "preview",
+			tunnel: {
+				autoStart: true,
+				env: "PREVIEW_TUNNEL_URL",
+				onReady,
+			},
+		});
+
+		onTestFinished(() => previewServer.close());
+
+		await setupPreviewTunnel(previewServer, ctx, tunnelManager);
+
+		const startTunnelCall = vi.mocked(startTunnel).mock.calls[0]?.[0];
+		expect(getTestEnv("PREVIEW_TUNNEL_URL")).toBe(
+			"https://example.trycloudflare.com/"
+		);
+		expect(onReady).toHaveBeenCalledTimes(1);
+		expect(onReady).toHaveBeenCalledWith({
+			urls: ["https://example.trycloudflare.com/"],
+			url: "https://example.trycloudflare.com/",
+			hostnames: ["example.trycloudflare.com"],
+			hostname: "example.trycloudflare.com",
+			origin: startTunnelCall?.origin.toString(),
+			mode: "preview",
+			kind: "quick",
+			name: undefined,
+		});
 	});
 
 	it("reuses the same tunnel when the origin is unchanged", async ({
@@ -253,6 +459,67 @@ describe("tunnel plugin", () => {
 		});
 	});
 
+	it("does not call onReady when a tunnel start result is ignored", async ({
+		expect,
+	}) => {
+		const firstReady = createDeferred<{
+			mode: "quick";
+			publicUrl: URL;
+		}>();
+		vi.mocked(startTunnel)
+			.mockReturnValueOnce({
+				ready: vi.fn().mockReturnValue(firstReady.promise),
+				isOpen: vi.fn(() => true),
+				extendExpiry: vi.fn(),
+				dispose: vi.fn(),
+			})
+			.mockReturnValueOnce({
+				ready: vi.fn().mockResolvedValue({
+					mode: "quick",
+					publicUrl: new URL("https://bar.trycloudflare.com"),
+				}),
+				isOpen: vi.fn(() => true),
+				extendExpiry: vi.fn(),
+				dispose: vi.fn(),
+			});
+
+		const onReady = vi.fn();
+		const ctx = createMockPluginContext({
+			type: "workers",
+			tunnel: { autoStart: true, onReady },
+		});
+		const server1 = await createServer();
+		const server2 = await createServer();
+		const tunnelManager = new TunnelManager(server1.config.logger);
+		vi.spyOn(server1, "restart").mockResolvedValue();
+		vi.spyOn(server2, "restart").mockResolvedValue();
+
+		onTestFinished(() => server1.close());
+		onTestFinished(() => server2.close());
+
+		await server1.listen(0);
+		await server2.listen(0);
+
+		const firstSetup = setupDevTunnel(server1, ctx, tunnelManager);
+		await vi.waitFor(() => {
+			expect(startTunnel).toHaveBeenCalledTimes(1);
+		});
+
+		await setupDevTunnel(server2, ctx, tunnelManager);
+		firstReady.resolve({
+			mode: "quick",
+			publicUrl: new URL("https://foo.trycloudflare.com"),
+		});
+		await firstSetup;
+
+		expect(onReady).toHaveBeenCalledTimes(1);
+		expect(onReady).toHaveBeenCalledWith(
+			expect.objectContaining({
+				url: "https://bar.trycloudflare.com/",
+			})
+		);
+	});
+
 	it("rejects tunnel sharing in middleware mode", async ({ expect }) => {
 		const server = { httpServer: null } as unknown as vite.ViteDevServer;
 
@@ -340,6 +607,28 @@ describe("tunnel plugin", () => {
 		await plugin.configureServer(server);
 
 		await expect(() => server.listen(0)).rejects.toBe(tunnelError);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(server.httpServer?.listening).toBe(false);
+	});
+
+	it("rejects server.listen when onReady rejects", async ({ expect }) => {
+		const onReadyError = new Error("onReady failed");
+		const onReady = vi.fn().mockRejectedValue(onReadyError);
+		const server = await createServer();
+		const ctx = createMockPluginContext({
+			type: "workers",
+			tunnel: { autoStart: true, onReady },
+		});
+
+		const plugin = tunnelPlugin(ctx);
+		const close = vi.spyOn(server, "close");
+
+		onTestFinished(() => server.close());
+
+		// @ts-expect-error The tunnel plugin accepts a server instance directly without relying on `this`
+		await plugin.configureServer(server);
+
+		await expect(() => server.listen(0)).rejects.toBe(onReadyError);
 		expect(close).toHaveBeenCalledTimes(1);
 		expect(server.httpServer?.listening).toBe(false);
 	});

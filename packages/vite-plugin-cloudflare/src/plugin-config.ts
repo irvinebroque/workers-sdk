@@ -38,9 +38,23 @@ import type { RawConfig } from "@cloudflare/workers-utils";
 import type { Unstable_Config } from "wrangler";
 
 export type PersistState = boolean | { path: string };
+export type TunnelMode = "dev" | "preview";
+export type TunnelKind = "quick" | "named";
+export interface TunnelReadyContext {
+	urls: string[];
+	url: string;
+	hostnames: string[];
+	hostname: string;
+	origin: string;
+	mode: TunnelMode;
+	kind: TunnelKind;
+	name?: string;
+}
 export type TunnelConfig = {
 	autoStart?: boolean;
 	name?: string;
+	env?: string | string[] | false;
+	onReady?: (context: TunnelReadyContext) => void | Promise<void>;
 };
 
 interface BaseWorkerConfig {
@@ -415,6 +429,8 @@ export async function resolvePluginConfig(
 				: {
 						autoStart: pluginConfig.tunnel?.autoStart ?? false,
 						name: pluginConfig.tunnel?.name,
+						env: pluginConfig.tunnel?.env,
+						onReady: pluginConfig.tunnel?.onReady,
 					},
 		experimental: {
 			headersAndRedirectsDevModeSupport:

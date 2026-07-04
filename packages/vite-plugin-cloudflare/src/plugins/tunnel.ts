@@ -7,6 +7,12 @@ import * as wrangler from "wrangler";
 import { assertIsNotPreview, assertIsPreview } from "../context";
 import { debuglog, createPlugin } from "../utils";
 import type { PluginContext } from "../context";
+import type {
+	TunnelConfig,
+	TunnelKind,
+	TunnelMode,
+	TunnelReadyContext,
+} from "../plugin-config";
 import type { Tunnel } from "@cloudflare/workers-utils";
 import type * as vite from "vite";
 
@@ -68,6 +74,11 @@ export const QUICK_TUNNEL_SSE_WARNING =
 
 export const QUICK_TUNNEL_ALLOWED_HOST = ".trycloudflare.com";
 
+interface TunnelStartResult {
+	publicUrls: string[];
+	kind: TunnelKind;
+}
+
 export class TunnelManager {
 	#logger: vite.Logger;
 	#origin?: string;
@@ -110,7 +121,7 @@ export class TunnelManager {
 		allowedHosts: true | string[] | undefined;
 		accountId: string | undefined;
 		complianceRegion: wrangler.Unstable_Config["compliance_region"];
-	}): Promise<string[] | null> {
+	}): Promise<TunnelStartResult | null> {
 		try {
 			const previousTunnel = this.#tunnel;
 
@@ -210,7 +221,7 @@ export class TunnelManager {
 		}
 	}
 
-	async #waitForPublicUrls(tunnel: Tunnel): Promise<string[] | null> {
+	async #waitForPublicUrls(tunnel: Tunnel): Promise<TunnelStartResult | null> {
 		try {
 			const result = await tunnel.ready();
 			if (this.#tunnel !== tunnel) {
@@ -222,14 +233,15 @@ export class TunnelManager {
 			}
 
 			if (result.mode === "named") {
-				return this.#publicUrls ?? null;
+				const publicUrls = this.#publicUrls;
+				return publicUrls ? { publicUrls, kind: "named" } : null;
 			}
 
 			const { publicUrl } = result;
 
 			debuglog("Tunnel is ready with public URL:", publicUrl);
 			this.#publicUrls = [publicUrl.toString()];
-			return this.#publicUrls;
+			return { publicUrls: this.#publicUrls, kind: "quick" };
 		} catch (error) {
 			if (this.#tunnel !== tunnel) {
 				return null;
@@ -419,6 +431,67 @@ export async function resolvePreviewTunnelOrigin(server: vite.PreviewServer) {
 	);
 }
 
+function createTunnelReadyContext(options: {
+	publicUrls: string[];
+	origin: string;
+	mode: TunnelMode;
+	kind: TunnelKind;
+	name?: string;
+}): TunnelReadyContext {
+	const urls = [...options.publicUrls];
+	const url = urls[0];
+	if (url === undefined) {
+		throw new Error("Tunnel did not provide any public URLs.");
+	}
+
+	const hostnames = urls.map((publicUrl) => {
+		return new URL(publicUrl).hostname;
+	});
+	const hostname = new URL(url).hostname;
+
+	return {
+		urls,
+		url,
+		hostnames,
+		hostname,
+		origin: options.origin,
+		mode: options.mode,
+		kind: options.kind,
+		name: options.name,
+	};
+}
+
+function publishTunnelEnv(env: TunnelConfig["env"], url: string): void {
+	if (!env) {
+		return;
+	}
+
+	const names = Array.isArray(env) ? env : [env];
+	for (const name of names) {
+		process.env[name] = url;
+	}
+}
+
+async function notifyTunnelReady(options: {
+	ctx: PluginContext;
+	publicUrls: string[];
+	origin: string;
+	mode: TunnelMode;
+	kind: TunnelKind;
+}): Promise<void> {
+	const tunnel = options.ctx.resolvedPluginConfig.tunnel;
+	const readyContext = createTunnelReadyContext({
+		publicUrls: options.publicUrls,
+		origin: options.origin,
+		mode: options.mode,
+		kind: options.kind,
+		name: tunnel.name,
+	});
+
+	publishTunnelEnv(tunnel.env, readyContext.url);
+	await tunnel.onReady?.(readyContext);
+}
+
 export async function setupDevTunnel(
 	server: vite.ViteDevServer,
 	ctx: PluginContext,
@@ -433,7 +506,7 @@ export async function setupDevTunnel(
 		return;
 	}
 
-	const publicUrls = await manager.startTunnel({
+	const result = await manager.startTunnel({
 		mode: "dev",
 		origin,
 		shortcutPressed,
@@ -444,16 +517,24 @@ export async function setupDevTunnel(
 		allowedHosts: true,
 	});
 
-	if (!publicUrls) {
+	if (!result) {
 		// This happens if the tunnel was restarted with a different origin before the first tunnel finished starting.
 		// In this case, we don't want to log anything since the new tunnel will log its own URL once it's ready.
 		return;
 	}
 
+	const publicUrls = result.publicUrls;
 	const allowedHosts = server.config.server.allowedHosts;
 	const tunnelHostnames = publicUrls.map((url) => new URL(url).hostname);
 
 	ctx.replaceTunnelHostnames(tunnelHostnames);
+	await notifyTunnelReady({
+		ctx,
+		publicUrls,
+		origin,
+		mode: "dev",
+		kind: result.kind,
+	});
 
 	if (
 		allowedHosts !== true &&
@@ -504,7 +585,7 @@ export async function setupPreviewTunnel(
 		return;
 	}
 
-	const publicUrls = await manager.startTunnel({
+	const result = await manager.startTunnel({
 		mode: "preview",
 		origin,
 		shortcutPressed,
@@ -514,9 +595,17 @@ export async function setupPreviewTunnel(
 		complianceRegion: ctx.allWorkerConfigs[0]?.compliance_region,
 	});
 
-	if (!publicUrls) {
+	if (!result) {
 		return;
 	}
+
+	await notifyTunnelReady({
+		ctx,
+		publicUrls: result.publicUrls,
+		origin,
+		mode: "preview",
+		kind: result.kind,
+	});
 
 	if (shortcutPressed) {
 		server.printUrls();
