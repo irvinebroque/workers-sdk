@@ -528,13 +528,6 @@ export async function setupDevTunnel(
 	const tunnelHostnames = publicUrls.map((url) => new URL(url).hostname);
 
 	ctx.replaceTunnelHostnames(tunnelHostnames);
-	await notifyTunnelReady({
-		ctx,
-		publicUrls,
-		origin,
-		mode: "dev",
-		kind: result.kind,
-	});
 
 	if (
 		allowedHosts !== true &&
@@ -542,6 +535,14 @@ export async function setupDevTunnel(
 	) {
 		await server.restart();
 	}
+
+	await notifyTunnelReady({
+		ctx,
+		publicUrls,
+		origin,
+		mode: "dev",
+		kind: result.kind,
+	});
 
 	if (shortcutPressed) {
 		server.printUrls();

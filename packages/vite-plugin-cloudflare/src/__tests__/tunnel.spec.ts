@@ -31,6 +31,7 @@ const TEST_TUNNEL_ENV_KEYS = [
 	"PUBLIC_TUNNEL_URL",
 	"PUBLIC_TUNNEL_URL_A",
 	"PUBLIC_TUNNEL_URL_B",
+	"PUBLIC_TUNNEL_URL_AFTER_RESTART",
 	"PUBLIC_TUNNEL_URL_DISABLED",
 	"NAMED_TUNNEL_URL",
 	"PREVIEW_TUNNEL_URL",
@@ -178,6 +179,40 @@ describe("tunnel plugin", () => {
 		expect(getTestEnv("PUBLIC_TUNNEL_URL")).toBe(
 			"https://example.trycloudflare.com/"
 		);
+	});
+
+	it("sets tunnel env var and calls onReady after restarting for allowed hosts", async ({
+		expect,
+	}) => {
+		const onReady = vi.fn();
+		const server = await createServer();
+		const ctx = createMockPluginContext({
+			type: "workers",
+			tunnel: {
+				autoStart: true,
+				env: "PUBLIC_TUNNEL_URL_AFTER_RESTART",
+				onReady,
+			},
+		});
+		const tunnelManager = new TunnelManager(server.config.logger);
+		const events: string[] = [];
+		const restart = vi.spyOn(server, "restart").mockImplementation(async () => {
+			events.push("restart");
+			expect(getTestEnv("PUBLIC_TUNNEL_URL_AFTER_RESTART")).toBeUndefined();
+			expect(onReady).not.toHaveBeenCalled();
+		});
+
+		onTestFinished(() => server.close());
+
+		await server.listen(0);
+		await setupDevTunnel(server, ctx, tunnelManager);
+
+		expect(restart).toHaveBeenCalledTimes(1);
+		expect(events).toEqual(["restart"]);
+		expect(getTestEnv("PUBLIC_TUNNEL_URL_AFTER_RESTART")).toBe(
+			"https://example.trycloudflare.com/"
+		);
+		expect(onReady).toHaveBeenCalledTimes(1);
 	});
 
 	it("sets multiple configured tunnel env vars", async ({ expect }) => {

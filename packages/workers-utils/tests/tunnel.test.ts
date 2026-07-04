@@ -48,6 +48,15 @@ function emitStderrNextTick(
 	});
 }
 
+function emitRegisteredConnectionNextTick(
+	proc: ReturnType<typeof createMockProcess>
+) {
+	return emitStderrNextTick(
+		proc,
+		"2024-01-15T10:30:00Z INF Registered tunnel connection connIndex=0\n"
+	);
+}
+
 function emitNextTick(
 	proc: ReturnType<typeof createMockProcess>,
 	event: string,
@@ -62,6 +71,21 @@ function emitNextTick(
 }
 
 const TEST_TIMEOUT_MS = 60_000;
+const QUICK_TUNNEL_PROPAGATION_DELAY_MS = 10_000;
+
+async function advanceQuickTunnelPropagationDelay() {
+	await Promise.resolve();
+	await vi.advanceTimersByTimeAsync(QUICK_TUNNEL_PROPAGATION_DELAY_MS);
+}
+
+async function emitQuickTunnelReadyNextTick(
+	proc: ReturnType<typeof createMockProcess>,
+	urlLog: string
+) {
+	await emitStderrNextTick(proc, urlLog);
+	await emitRegisteredConnectionNextTick(proc);
+	await advanceQuickTunnelPropagationDelay();
+}
 
 describe("startTunnel", () => {
 	beforeEach(() => {
@@ -83,7 +107,7 @@ describe("startTunnel", () => {
 		});
 		onTestFinished(() => tunnel.dispose());
 
-		await emitStderrNextTick(
+		await emitQuickTunnelReadyNextTick(
 			proc,
 			"2024-01-15T10:30:00Z INF | https://foo-bar-baz.trycloudflare.com |\n"
 		);
@@ -94,7 +118,46 @@ describe("startTunnel", () => {
 		});
 	});
 
-	it("should resolve named tunnels after spawning cloudflared", async ({
+	it("should wait for a registered connection after the public URL", async ({
+		expect,
+	}) => {
+		const proc = createMockProcess();
+		vi.mocked(spawnCloudflared).mockResolvedValue(proc as never);
+
+		const tunnel = startTunnel({
+			origin: new URL("http://localhost:8787"),
+			timeoutMs: TEST_TIMEOUT_MS,
+		});
+		onTestFinished(() => tunnel.dispose());
+
+		let resolved = false;
+		const readyPromise = tunnel.ready().then((result) => {
+			resolved = true;
+			return result;
+		});
+
+		await emitStderrNextTick(
+			proc,
+			"2024-01-15T10:30:00Z INF | https://foo-bar-baz.trycloudflare.com |\n"
+		);
+		await Promise.resolve();
+
+		expect(resolved).toBe(false);
+
+		await emitRegisteredConnectionNextTick(proc);
+		await Promise.resolve();
+
+		expect(resolved).toBe(false);
+
+		await advanceQuickTunnelPropagationDelay();
+
+		await expect(readyPromise).resolves.toEqual({
+			mode: "quick",
+			publicUrl: new URL("https://foo-bar-baz.trycloudflare.com"),
+		});
+	});
+
+	it("should resolve named tunnels after registering a connection", async ({
 		expect,
 	}) => {
 		const proc = createMockProcess();
@@ -106,6 +169,7 @@ describe("startTunnel", () => {
 			timeoutMs: TEST_TIMEOUT_MS,
 		});
 		onTestFinished(() => tunnel.dispose());
+		await emitRegisteredConnectionNextTick(proc);
 
 		await expect(tunnel.ready()).resolves.toEqual({ mode: "named" });
 	});
@@ -119,7 +183,7 @@ describe("startTunnel", () => {
 			timeoutMs: TEST_TIMEOUT_MS,
 		});
 
-		await emitStderrNextTick(
+		await emitQuickTunnelReadyNextTick(
 			proc,
 			"INF https://test-tunnel.trycloudflare.com\n"
 		);
@@ -141,6 +205,7 @@ describe("startTunnel", () => {
 			timeoutMs: TEST_TIMEOUT_MS,
 		});
 
+		await emitRegisteredConnectionNextTick(proc);
 		await tunnel.ready();
 
 		expect(spawnCloudflared).toHaveBeenCalledWith(
@@ -235,7 +300,10 @@ describe("startTunnel", () => {
 			timeoutMs: TEST_TIMEOUT_MS,
 		});
 
-		await emitStderrNextTick(proc, "INF https://my-tunnel.trycloudflare.com\n");
+		await emitQuickTunnelReadyNextTick(
+			proc,
+			"INF https://my-tunnel.trycloudflare.com\n"
+		);
 		await tunnel.ready();
 		tunnel.dispose();
 
@@ -255,7 +323,10 @@ describe("startTunnel", () => {
 			timeoutMs: TEST_TIMEOUT_MS,
 		});
 
-		await emitStderrNextTick(proc, "INF https://my-tunnel.trycloudflare.com\n");
+		await emitQuickTunnelReadyNextTick(
+			proc,
+			"INF https://my-tunnel.trycloudflare.com\n"
+		);
 		await tunnel.ready();
 
 		tunnel.dispose();
@@ -309,7 +380,7 @@ describe("startTunnel", () => {
 		});
 
 		await emitStderrNextTick(proc, "INF https://split-");
-		await emitStderrNextTick(proc, "url-tunnel.trycloudflare.com\n");
+		await emitQuickTunnelReadyNextTick(proc, "url-tunnel.trycloudflare.com\n");
 
 		await expect(tunnel.ready()).resolves.toEqual({
 			mode: "quick",
@@ -382,7 +453,10 @@ describe("startTunnel", () => {
 			logger,
 		});
 
-		await emitStderrNextTick(proc, "INF https://my-tunnel.trycloudflare.com\n");
+		await emitQuickTunnelReadyNextTick(
+			proc,
+			"INF https://my-tunnel.trycloudflare.com\n"
+		);
 		await tunnel.ready();
 
 		await vi.advanceTimersByTimeAsync(60_000);
@@ -414,7 +488,10 @@ describe("startTunnel", () => {
 			logger,
 		});
 
-		await emitStderrNextTick(proc, "INF https://my-tunnel.trycloudflare.com\n");
+		await emitQuickTunnelReadyNextTick(
+			proc,
+			"INF https://my-tunnel.trycloudflare.com\n"
+		);
 		await tunnel.ready();
 
 		await vi.advanceTimersByTimeAsync(60_000);
@@ -455,7 +532,10 @@ describe("startTunnel", () => {
 			logger,
 		});
 
-		await emitStderrNextTick(proc, "INF https://my-tunnel.trycloudflare.com\n");
+		await emitQuickTunnelReadyNextTick(
+			proc,
+			"INF https://my-tunnel.trycloudflare.com\n"
+		);
 		await tunnel.ready();
 		tunnel.extendExpiry();
 		tunnel.extendExpiry();

@@ -55,12 +55,13 @@ export function handleWebSocket(
 				: `${protocol}//${rawHost}`;
 			const url = new URL(request.url ?? "", base);
 
-			const isViteRequest =
-				request.headers["sec-websocket-protocol"]?.startsWith("vite");
 			const isSandboxRequest = hasSandboxOrigin(url.origin);
 
-			// Ignore Vite HMR WebSockets but forward on all sandbox requests.
-			if (isViteRequest && !isSandboxRequest) {
+			// Ignore Vite/Vitest-owned WebSockets but forward on all sandbox requests.
+			if (
+				shouldPassThroughWebSocketUpgrade(request, url) &&
+				!isSandboxRequest
+			) {
 				return;
 			}
 
@@ -116,6 +117,40 @@ const EXCLUDED_RESPONSE_HEADERS = new Set([
 	"transfer-encoding",
 	"upgrade",
 ]);
+
+const VITEST_BROWSER_RPC_WEBSOCKET_PROTOCOL = "vitest-browser-rpc";
+const VITEST_BROWSER_API_PATHNAME = "/__vitest_browser_api__";
+
+function shouldPassThroughWebSocketUpgrade(
+	request: IncomingMessage,
+	url: URL
+): boolean {
+	return isViteRequest(request) || isVitestBrowserRpcRequest(request, url);
+}
+
+function isViteRequest(request: IncomingMessage): boolean {
+	return request.headers["sec-websocket-protocol"]?.startsWith("vite") ?? false;
+}
+
+function isVitestBrowserRpcRequest(
+	request: IncomingMessage,
+	url: URL
+): boolean {
+	return (
+		getWebSocketProtocols(request).includes(
+			VITEST_BROWSER_RPC_WEBSOCKET_PROTOCOL
+		) || url.pathname === VITEST_BROWSER_API_PATHNAME
+	);
+}
+
+function getWebSocketProtocols(request: IncomingMessage): string[] {
+	return (
+		request.headers["sec-websocket-protocol"]
+			?.split(",")
+			.map((protocol) => protocol.trim())
+			.filter(Boolean) ?? []
+	);
+}
 
 function appendWorkerResponseHeaders(
 	responseHeaders: string[],
